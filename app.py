@@ -22,6 +22,12 @@ from sentence_transformers import SentenceTransformer
 # =========================
 # CONFIG
 # =========================
+
+if "OPENAI_API_KEY" in st.secrets:
+    os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+
+
+
 GOVUK_URL = "https://www.gov.uk/government/publications/right-to-start-consultant-led-treatment-within-18-weeks/referral-to-treatment-consultant-led-waiting-times-rules-suite-october-2022"
 
 # Put your PDFs in the repo under ./data/ with these filenames (or adjust paths below)
@@ -289,14 +295,25 @@ def retrieve(index: faiss.Index, chunks: List[Chunk], query: str, k: int = 8) ->
 # LLM CALL (OPTIONAL)
 # =========================
 def _openai_client():
-    """
-    Lazy import so requirements don’t break if you remove openai.
-    """
     try:
         from openai import OpenAI
-        return OpenAI()
+
+        # Prefer Streamlit secrets, then env var
+        api_key = None
+        try:
+            api_key = st.secrets.get("OPENAI_API_KEY", None)
+        except Exception:
+            api_key = None
+
+        api_key = api_key or os.getenv("OPENAI_API_KEY", "")
+
+        if not api_key:
+            return None
+
+        return OpenAI(api_key=api_key)
     except Exception:
         return None
+
 
 
 def call_llm_answer(question: str, evidence: List[Tuple[Chunk, float]], model: str) -> str:
