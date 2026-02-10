@@ -386,9 +386,7 @@ def call_llm_verify(answer: str, evidence: List[Tuple[Chunk, float]], model: str
 # =========================
 # UI
 # =========================
-st.title("RTT Policy Chatbot (GOV.UK Rules Suite + NHS England Guidance PDFs)")
-st.caption("Answers are grounded in the provided sources with citations. If evidence is weak, the bot will refuse.")
-
+st.title("RTT Guidance Bot")
 
 def _mask(k: str) -> str:
     if not k:
@@ -398,140 +396,29 @@ def _mask(k: str) -> str:
 
 with st.sidebar:
     st.header("Sources")
-    st.markdown("**GOV.UK page**")
+    st.markdown("**GOV.UK**")
     st.write(GOVUK_URL)
 
-    st.markdown("**PDFs** (from repo `data/`)")
+    st.markdown("**NHSE Guidance Docs**")
     pdf_paths = []
     for p in DEFAULT_PDF_PATHS:
         ok = os.path.exists(p)
-        st.write(("✅ " if ok else "❌ ") + p)
+        st.write(p)
         pdf_paths.append(p)
 
     st.divider()
 
-    # =========================
-    # RETRIEVAL SETTINGS
-    # =========================
-    st.header("Retrieval settings")
-    k = st.slider("Top-K chunks", 4, 15, 8, 1)
-    gate = st.slider(
-        "Evidence threshold (cosine similarity)",
-        0.20, 0.70, 0.38, 0.01
-    )
-    st.caption(
-        "If the best match is below the threshold, the bot will refuse "
-        "(reduces hallucinations)."
-    )
-
-    st.divider()
-
-    # =========================
-    # LLM SETTINGS
-    # =========================
-    st.header("LLM settings")
-    use_llm = st.toggle(
-        "Use LLM to generate answer (needs API key)",
-        value=True
-    )
-    llm_model = st.text_input(
-        "Model name",
-        value=DEFAULT_LLM_MODEL
-    )
-    verifier = st.toggle(
-        "Run verifier pass (2nd call)",
-        value=True
-    )
-
-    st.divider()
-
-    # =========================
-    # API KEY STATUS
-    # =========================
-    st.header("API key status")
-
-    try:
-        secret_key = st.secrets.get("OPENAI_API_KEY", "")
-    except Exception:
-        secret_key = ""
-
-    env_key = os.getenv("OPENAI_API_KEY", "")
-
-    st.write("Secrets key:", "✅ detected" if bool(secret_key) else "❌ not found")
-    st.write("Env var key:", "✅ detected" if bool(env_key) else "❌ not found")
-
-    def _mask(k: str) -> str:
-        if not k:
-            return ""
-        return k[:6] + "..." + k[-4:]
-
-    if secret_key or env_key:
-        st.code(
-            f"secrets: {_mask(secret_key)}\n"
-            f"env:     {_mask(env_key)}"
-        )
-
-    st.divider()
-
-    # =========================
-    # OPENAI HEALTHCHECK
-    # =========================
-    st.header("OpenAI healthcheck")
-
-    if st.button("Test OpenAI client"):
-        # 1. Can we import openai?
-        try:
-            import openai
-            st.write(
-                "openai package version:",
-                getattr(openai, "__version__", "unknown")
-            )
-        except Exception as e:
-            st.error(f"❌ Failed to import openai: {e}")
-            st.stop()
-
-        # 2. Can we import OpenAI class?
-        try:
-            from openai import OpenAI
-            st.write("OpenAI class import: ✅ ok")
-        except Exception as e:
-            st.error(f"❌ Failed `from openai import OpenAI`: {e}")
-            st.stop()
-
-        # 3. Do we actually have a key at runtime?
-        api_key = secret_key or env_key
-        if not api_key:
-            st.error("❌ No API key available at runtime.")
-            st.stop()
-
-        # 4. Can we create a client and make a trivial call?
-        try:
-            client = OpenAI(api_key=api_key)
-            _ = client.models.list()
-            st.success("✅ OpenAI client works (models.list succeeded)")
-        except Exception as e:
-            st.error(f"❌ OpenAI client initialisation/call failed:\n{e}")
-
-    st.divider()
-
-    # =========================
-    # INDEX MAINTENANCE
-    # =========================
-    st.header("Index")
-
-    if st.button("Rebuild index"):
-        try:
-            for fn in os.listdir(INDEX_DIR):
-                os.remove(os.path.join(INDEX_DIR, fn))
-            st.success("Deleted cached index files. Reload to rebuild.")
-        except Exception as e:
-            st.error(f"Could not clear cache: {e}")
+    k = 4
+    gate = 0.38
+    use_llm = True
+    llm_model = DEFAULT_LLM_MODEL
+    verifier = True
 
 # Build/load index
-with st.spinner("Loading/building index..."):
+with st.spinner("Building index..."):
     index, chunks, source_hash = build_or_load_index(GOVUK_URL, pdf_paths)
 
-st.success(f"Index ready. Chunks: {len(chunks):,}. Index id: {source_hash}")
+st.success(f"Index ready.")
 
 # Chat state
 if "messages" not in st.session_state:
@@ -588,12 +475,12 @@ if prompt:
                     answer = call_llm_answer(prompt, evidence, llm_model)
                 except Exception as e:
                     answer = (
-                        f"LLM generation failed ({e}).\n\n"
+                        f"LLM failed ({e}).\n\n"
                         "Showing top evidence only. You can still use the retrieved passages above."
                     )
 
             verification = None
-            if verifier and "LLM generation failed" not in answer:
+            if verifier and "LLM failed" not in answer:
                 with st.spinner("Verifying answer against sources..."):
                     try:
                         verification = call_llm_verify(answer, evidence, llm_model)
