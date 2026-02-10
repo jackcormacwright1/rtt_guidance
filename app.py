@@ -441,12 +441,12 @@ if prompt:
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    with st.spinner("Retrieving relevant policy text..."):
+    with st.spinner("Retrieving relevant guidance..."):
         evidence = retrieve(index, chunks, prompt, k=k)
 
     best_score = evidence[0][1] if evidence else 0.0
 
-    with st.expander("Retrieved evidence (top matches)", expanded=False):
+    with st.expander("Retrieved guidance (top matches)", expanded=False):
         st.write(f"Best similarity: **{best_score:.3f}** (threshold: {gate:.3f})")
         for i, (ch, score) in enumerate(evidence, start=1):
             st.markdown(f"**S{i} — score {score:.3f}** — {ch.citation}")
@@ -457,7 +457,7 @@ if prompt:
 
     if best_score < gate:
         answer = (
-            "I can’t find strong enough support for that in the provided sources.\n\n"
+            "I can’t find strong enough evidence for that in the guidance.\n\n"
             "Try rephrasing (e.g. include whether it’s an RTT pathway, DNA, active monitoring, treatment start, etc.), "
             "or check the retrieved evidence section to see what *is* covered."
         )
@@ -470,7 +470,7 @@ if prompt:
         )
 
         if use_llm and api_key_present:
-            with st.spinner("Generating grounded answer..."):
+            with st.spinner("Generating answer..."):
                 try:
                     answer = call_llm_answer(prompt, evidence, llm_model)
                 except Exception as e:
@@ -481,7 +481,7 @@ if prompt:
 
             verification = None
             if verifier and "LLM failed" not in answer:
-                with st.spinner("Verifying answer against sources..."):
+                with st.spinner("Verifying answer..."):
                     try:
                         verification = call_llm_verify(answer, evidence, llm_model)
                     except Exception as e:
