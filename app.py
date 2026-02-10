@@ -10,42 +10,38 @@ from typing import List, Dict, Tuple, Optional
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-
 from pypdf import PdfReader
 
 import numpy as np
 import faiss
-
 from sentence_transformers import SentenceTransformer
 
 
 # =========================
-# CONFIG
+# CONFIG / SECRETS
 # =========================
+st.set_page_config(page_title="RTT Policy Chatbot", layout="wide")
 
-if "OPENAI_API_KEY" in st.secrets:
-    os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
-
-
+# Robust secrets -> env (Streamlit Cloud secrets do NOT always appear as env vars)
+try:
+    key = st.secrets.get("OPENAI_API_KEY", "")
+    if key:
+        os.environ["OPENAI_API_KEY"] = key
+except Exception:
+    pass
 
 GOVUK_URL = "https://www.gov.uk/government/publications/right-to-start-consultant-led-treatment-within-18-weeks/referral-to-treatment-consultant-led-waiting-times-rules-suite-october-2022"
 
-# Put your PDFs in the repo under ./data/ with these filenames (or adjust paths below)
 DEFAULT_PDF_PATHS = [
     "data/Recording-and-reporting-RTT-waiting-times-guidance-v5.2-Feb25.pdf",
     "data/Recording-and-reporting-RTT-waiting-times-guidance-Accompanying-FAQs-v1.4-Feb25.pdf",
 ]
 
-# Local cache folder (Community Cloud filesystem is ephemeral but fine for runtime)
 CACHE_DIR = ".cache_rtt_bot"
 INDEX_DIR = os.path.join(CACHE_DIR, "index")
 os.makedirs(INDEX_DIR, exist_ok=True)
 
-# Embedding model (small + decent)
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-
-# If you provide OPENAI_API_KEY in Streamlit secrets, we’ll use it for generative answers
-# Otherwise the app falls back to extractive answers (top passages + minimal synthesis)
 DEFAULT_LLM_MODEL = "gpt-4o-mini"
 
 
@@ -55,8 +51,8 @@ DEFAULT_LLM_MODEL = "gpt-4o-mini"
 @dataclass
 class Chunk:
     text: str
-    source: str                 # e.g. "GOVUK" or filename
-    citation: str               # e.g. "GOV.UK – Clock starts – Rule 1" or "PDF – p12 – Section ..."
+    source: str
+    citation: str
     url: Optional[str] = None
     page: Optional[int] = None
     heading: Optional[str] = None
@@ -66,7 +62,7 @@ class Chunk:
 # HELPERS
 # =========================
 def _clean_text(s: str) -> str:
-    s = s.replace("\u00a0", " ")
+    s = (s or "").replace("\u00a0", " ")
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
@@ -86,13 +82,16 @@ def _hash_sources(url: str, pdf_paths: List[str]) -> str:
     return h.hexdigest()[:16]
 
 
-def _split_into_chunks(text: str, source: str, base_citation: str, url: Optional[str] = None,
-                      heading: Optional[str] = None, page: Optional[int] = None,
-                      max_chars: int = 1800, overlap_chars: int = 250) -> List[Chunk]:
-    """
-    Simple character-based chunking with overlap.
-    Good enough for policy text where headings matter; we pass headings in metadata.
-    """
+def _split_into_chunks(
+    text: str,
+    source: str,
+    base_citation: str,
+    url: Optional[str] = None,
+    heading: Optional[str] = None,
+    page: Optional[int] = None,
+    max_chars: int = 1800,
+    overlap_chars: int = 250,
+) -> List[Chunk]:
     text = _clean_text(text)
     if not text:
         return []
@@ -101,15 +100,14 @@ def _split_into_chunks(text: str, source: str, base_citation: str, url: Optional
     start = 0
     while start < len(text):
         end = min(len(text), start + max_chars)
-        chunk_text = text[start:end]
-        chunk_text = chunk_text.strip()
+        chunk_text = text[start:end].strip()
 
         if chunk_text:
             citation = base_citation
-            if page is not None:
-                citation = f"{base_citation} (p{page})"
             if heading:
-                citation = f"{base_citation} – {heading}" + (f" (p{page})" if page is not None else "")
+                citation = f"{citation} – {heading}"
+            if page is not None:
+                citation = f"{citation} (p{page})"
 
             chunks.append(
                 Chunk(
@@ -118,7 +116,7 @@ def _split_into_chunks(text: str, source: str, base_citation: str, url: Optional
                     citation=citation,
                     url=url,
                     page=page,
-                    heading=heading
+                    heading=heading,
                 )
             )
 
@@ -134,51 +132,37 @@ def _split_into_chunks(text: str, source: str, base_citation: str, url: Optional
 # =========================
 @st.cache_data(show_spinner=False)
 def fetch_govuk_article(url: str) -> Dict[str, str]:
-    """
-    Fetch GOV.UK page and extract main article text grouped by headings.
-    Returns a dict: {heading: text_block}
-    """
     r = requests.get(url, timeout=30, headers={"User-Agent": "RTT-Policy-Bot/1.0"})
     r.raise_for_status()
 
     soup = BeautifulSoup(r.text, "html.parser")
+    main = soup.find("main") or soup
 
-    # GOV.UK main content often sits here
-    main = soup.find("main")
-    if main is None:
-        main = soup
-
-    # Extract headings and paragraphs in order
-    headings = []
     current_heading = "Intro"
     sections: Dict[str, List[str]] = {current_heading: []}
 
     for el in main.find_all(["h2", "h3", "h4", "p", "li"]):
         if el.name in ["h2", "h3", "h4"]:
             current_heading = _clean_text(el.get_text(" "))
-            if current_heading not in sections:
-                sections[current_heading] = []
-            headings.append(current_heading)
+            sections.setdefault(current_heading, [])
         else:
             txt = _clean_text(el.get_text(" "))
             if txt:
                 sections.setdefault(current_heading, []).append(txt)
 
-    # Join section text
-    out = {}
+    out: Dict[str, str] = {}
     for h, lines in sections.items():
         block = "\n".join(lines).strip()
         if block:
             out[h] = block
-
     return out
 
 
 @st.cache_data(show_spinner=False)
 def read_pdf_pages(pdf_path: str) -> List[str]:
     reader = PdfReader(pdf_path)
-    pages = []
-    for i, page in enumerate(reader.pages, start=1):
+    pages: List[str] = []
+    for page in reader.pages:
         try:
             txt = page.extract_text() or ""
         except Exception:
@@ -190,21 +174,19 @@ def read_pdf_pages(pdf_path: str) -> List[str]:
 def build_chunks(url: str, pdf_paths: List[str]) -> List[Chunk]:
     chunks: List[Chunk] = []
 
-    # GOV.UK sections by heading
     sections = fetch_govuk_article(url)
     for heading, block in sections.items():
-        base_cite = "GOV.UK Rules Suite (Oct 2022)"
-        chs = _split_into_chunks(
-            text=block,
-            source="GOVUK",
-            base_citation=base_cite,
-            url=url,
-            heading=heading,
-            page=None
+        chunks.extend(
+            _split_into_chunks(
+                text=block,
+                source="GOVUK",
+                base_citation="GOV.UK Rules Suite (Oct 2022)",
+                url=url,
+                heading=heading,
+                page=None,
+            )
         )
-        chunks.extend(chs)
 
-    # PDFs by page
     for pdf_path in pdf_paths:
         if not os.path.exists(pdf_path):
             continue
@@ -215,20 +197,18 @@ def build_chunks(url: str, pdf_paths: List[str]) -> List[Chunk]:
         for page_num, page_text in enumerate(pages, start=1):
             if not page_text:
                 continue
-
-            base_cite = f"{filename}"
-            # Keep page as a “heading-like” anchor
-            chs = _split_into_chunks(
-                text=page_text,
-                source=filename,
-                base_citation=base_cite,
-                url=None,
-                heading=None,
-                page=page_num,
-                max_chars=1800,
-                overlap_chars=200
+            chunks.extend(
+                _split_into_chunks(
+                    text=page_text,
+                    source=filename,
+                    base_citation=filename,
+                    url=None,
+                    heading=None,
+                    page=page_num,
+                    max_chars=1800,
+                    overlap_chars=200,
+                )
             )
-            chunks.extend(chs)
 
     return chunks
 
@@ -259,7 +239,6 @@ def build_or_load_index(url: str, pdf_paths: List[str]) -> Tuple[faiss.Index, Li
             chunks = pickle.load(f)
         return index, chunks, source_hash
 
-    # Build fresh
     chunks = build_chunks(url, pdf_paths)
     if not chunks:
         raise RuntimeError("No chunks found. Check the URL and PDF paths.")
@@ -268,7 +247,7 @@ def build_or_load_index(url: str, pdf_paths: List[str]) -> Tuple[faiss.Index, Li
     embs = embedder.encode(texts, show_progress_bar=False, convert_to_numpy=True, normalize_embeddings=True)
 
     dim = embs.shape[1]
-    index = faiss.IndexFlatIP(dim)  # cosine if vectors are normalised
+    index = faiss.IndexFlatIP(dim)  # cosine similarity because vectors are normalized
     index.add(embs.astype(np.float32))
 
     faiss.write_index(index, idx_path)
@@ -283,65 +262,67 @@ def retrieve(index: faiss.Index, chunks: List[Chunk], query: str, k: int = 8) ->
     q_emb = embedder.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
 
     scores, ids = index.search(q_emb, k)
-    results = []
+    out: List[Tuple[Chunk, float]] = []
     for score, idx in zip(scores[0].tolist(), ids[0].tolist()):
         if idx < 0:
             continue
-        results.append((chunks[idx], float(score)))
-    return results
+        out.append((chunks[idx], float(score)))
+    return out
 
 
 # =========================
-# LLM CALL (OPTIONAL)
+# OPENAI (LLM + VERIFIER)
 # =========================
 def _openai_client():
+    """
+    Create an OpenAI client using Streamlit secrets or env var.
+    Also surfaces a useful error in the sidebar (without leaking secrets).
+    """
     try:
         from openai import OpenAI
 
-        # Prefer Streamlit secrets, then env var
-        api_key = None
         try:
-            api_key = st.secrets.get("OPENAI_API_KEY", None)
+            secret_key = st.secrets.get("OPENAI_API_KEY", "")
         except Exception:
-            api_key = None
+            secret_key = ""
 
-        api_key = api_key or os.getenv("OPENAI_API_KEY", "")
+        env_key = os.getenv("OPENAI_API_KEY", "")
+        api_key = secret_key or env_key
 
         if not api_key:
             return None
 
         return OpenAI(api_key=api_key)
-    except Exception:
+    except Exception as e:
+        # Show the reason once (helps debugging in Cloud)
+        try:
+            st.session_state["_openai_init_error"] = str(e)
+        except Exception:
+            pass
         return None
 
 
-
 def call_llm_answer(question: str, evidence: List[Tuple[Chunk, float]], model: str) -> str:
-    """
-    Generate a grounded answer with citations.
-    """
     client = _openai_client()
     if client is None:
         raise RuntimeError("OpenAI client not available. Check requirements / secrets.")
 
-    # Build context with numbered sources
     ctx_lines = []
-    for i, (ch, score) in enumerate(evidence, start=1):
+    for i, (ch, _score) in enumerate(evidence, start=1):
         ctx_lines.append(f"[S{i}] {ch.citation}")
         if ch.url:
             ctx_lines.append(f"URL: {ch.url}")
         ctx_lines.append(ch.text)
         ctx_lines.append("")
-
     context = "\n".join(ctx_lines).strip()
 
     system = (
-        "You are a policy Q&A assistant for NHS RTT (Referral to Treatment) rules and guidance.\n"
+        "You are a strict policy Q&A assistant for NHS RTT (Referral to Treatment) rules and guidance.\n"
         "You MUST answer ONLY using the provided sources.\n"
         "If the sources do not contain the answer, say you cannot find it in the provided policies.\n"
         "Every key claim MUST include one or more citations in the form [S1], [S2]...\n"
         "Keep the answer concise, operational, and avoid speculation.\n"
-        "If the question is ambiguous, ask a single clarifying question, unless the sources clearly resolve it.\n"
+        "If the question is ambiguous, ask a single clarifying question unless the sources clearly resolve it.\n"
     )
 
     user = (
@@ -352,26 +333,19 @@ def call_llm_answer(question: str, evidence: List[Tuple[Chunk, float]], model: s
 
     resp = client.chat.completions.create(
         model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=0.2,
     )
     return resp.choices[0].message.content
 
 
 def call_llm_verify(answer: str, evidence: List[Tuple[Chunk, float]], model: str) -> Dict:
-    """
-    Verification pass: label claims Supported / Not Supported / Ambiguous using only evidence.
-    Returns a structured dict.
-    """
     client = _openai_client()
     if client is None:
         raise RuntimeError("OpenAI client not available. Check requirements / secrets.")
 
     ctx_lines = []
-    for i, (ch, score) in enumerate(evidence, start=1):
+    for i, (ch, _score) in enumerate(evidence, start=1):
         ctx_lines.append(f"[S{i}] {ch.citation}")
         if ch.url:
             ctx_lines.append(f"URL: {ch.url}")
@@ -385,27 +359,24 @@ def call_llm_verify(answer: str, evidence: List[Tuple[Chunk, float]], model: str
         "Return JSON only."
     )
 
-    user = {
+    payload = {
         "answer": answer,
         "sources": context,
         "instructions": {
             "extract_atomic_claims": True,
             "label_each_claim": ["SUPPORTED", "NOT_SUPPORTED", "AMBIGUOUS"],
             "cite_supporting_sources": True,
-            "if_not_supported_suggest_fix": True
-        }
+            "if_not_supported_suggest_fix": True,
+        },
     }
 
     resp = client.chat.completions.create(
         model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": json.dumps(user)},
-        ],
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": json.dumps(payload)}],
         temperature=0.0,
     )
     txt = resp.choices[0].message.content.strip()
-    # best effort JSON parse
+
     try:
         return json.loads(txt)
     except Exception:
@@ -413,12 +384,17 @@ def call_llm_verify(answer: str, evidence: List[Tuple[Chunk, float]], model: str
 
 
 # =========================
-# STREAMLIT UI
+# UI
 # =========================
-st.set_page_config(page_title="RTT Policy Chatbot", layout="wide")
-
 st.title("RTT Policy Chatbot (GOV.UK Rules Suite + NHS England Guidance PDFs)")
 st.caption("Answers are grounded in the provided sources with citations. If evidence is weak, the bot will refuse.")
+
+
+def _mask(k: str) -> str:
+    if not k:
+        return ""
+    return k[:6] + "..." + k[-4:]
+
 
 with st.sidebar:
     st.header("Sources")
@@ -426,7 +402,6 @@ with st.sidebar:
     st.write(GOVUK_URL)
 
     st.markdown("**PDFs** (from repo `data/`)")
-
     pdf_paths = []
     for p in DEFAULT_PDF_PATHS:
         ok = os.path.exists(p)
@@ -446,9 +421,24 @@ with st.sidebar:
     verifier = st.toggle("Run verifier pass (2nd call)", value=True)
 
     st.divider()
+    st.header("API key status")
+    try:
+        secret_key = st.secrets.get("OPENAI_API_KEY", "")
+    except Exception:
+        secret_key = ""
+    env_key = os.getenv("OPENAI_API_KEY", "")
+
+    st.write("Secrets key:", "✅ detected" if bool(secret_key) else "❌ not found")
+    st.write("Env var key:", "✅ detected" if bool(env_key) else "❌ not found")
+    if secret_key or env_key:
+        st.code(f"secrets: {_mask(secret_key)}\nenv:     {_mask(env_key)}")
+
+    if st.session_state.get("_openai_init_error"):
+        st.error(f"OpenAI init error: {st.session_state['_openai_init_error']}")
+
+    st.divider()
     st.header("Index")
     if st.button("Rebuild index"):
-        # Clear cached index files by bumping hash via deleting all indices
         try:
             for fn in os.listdir(INDEX_DIR):
                 os.remove(os.path.join(INDEX_DIR, fn))
@@ -457,7 +447,7 @@ with st.sidebar:
             st.error(f"Could not clear cache: {e}")
 
 
-# Build/load index (fast after first time)
+# Build/load index
 with st.spinner("Loading/building index..."):
     index, chunks, source_hash = build_or_load_index(GOVUK_URL, pdf_paths)
 
@@ -466,7 +456,10 @@ st.success(f"Index ready. Chunks: {len(chunks):,}. Index id: {source_hash}")
 # Chat state
 if "messages" not in st.session_state:
     st.session_state.messages = [
-        {"role": "assistant", "content": "Ask me RTT rules questions (clock starts/stops, DNAs, active monitoring, etc.). I will cite the sources I used."}
+        {
+            "role": "assistant",
+            "content": "Ask me RTT rules questions (clock starts/stops, DNAs, active monitoring, etc.). I will cite the sources I used.",
+        }
     ]
 
 # Render messages
@@ -481,13 +474,11 @@ if prompt:
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Retrieve evidence
     with st.spinner("Retrieving relevant policy text..."):
         evidence = retrieve(index, chunks, prompt, k=k)
 
     best_score = evidence[0][1] if evidence else 0.0
 
-    # Evidence display (always)
     with st.expander("Retrieved evidence (top matches)", expanded=False):
         st.write(f"Best similarity: **{best_score:.3f}** (threshold: {gate:.3f})")
         for i, (ch, score) in enumerate(evidence, start=1):
@@ -497,7 +488,6 @@ if prompt:
             st.markdown(ch.text[:2000] + ("…" if len(ch.text) > 2000 else ""))
             st.divider()
 
-    # Gate on evidence
     if best_score < gate:
         answer = (
             "I can’t find strong enough support for that in the provided sources.\n\n"
@@ -508,8 +498,10 @@ if prompt:
             st.markdown(answer)
         st.session_state.messages.append({"role": "assistant", "content": answer})
     else:
-        # Decide whether to generate with LLM
-        api_key_present = bool(st.secrets.get("OPENAI_API_KEY", "")) or bool(os.getenv("OPENAI_API_KEY", ""))
+        api_key_present = bool(os.getenv("OPENAI_API_KEY", "")) or bool(
+            (st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else "")
+        )
+
         if use_llm and api_key_present:
             with st.spinner("Generating grounded answer..."):
                 try:
@@ -520,9 +512,8 @@ if prompt:
                         "Showing top evidence only. You can still use the retrieved passages above."
                     )
 
-            # Optional verifier
             verification = None
-            if verifier:
+            if verifier and "LLM generation failed" not in answer:
                 with st.spinner("Verifying answer against sources..."):
                     try:
                         verification = call_llm_verify(answer, evidence, llm_model)
@@ -531,29 +522,25 @@ if prompt:
 
             with st.chat_message("assistant"):
                 st.markdown(answer)
-
                 if verification:
                     with st.expander("Verification report", expanded=False):
                         st.json(verification)
 
             st.session_state.messages.append({"role": "assistant", "content": answer})
         else:
-            # Exuctive fallback: no LLM key
-            # Provide a cautious extractive summary by listing the top passages and a small hint
             top = evidence[:5]
             lines = [
                 "I’m running in **evidence-only mode** (no LLM API key configured).",
                 "Here are the most relevant passages I found — these should contain the answer, with citations:",
-                ""
+                "",
             ]
-            for i, (ch, score) in enumerate(top, start=1):
+            for i, (ch, _score) in enumerate(top, start=1):
                 snippet = ch.text.strip().replace("\n", " ")
                 snippet = snippet[:400] + ("…" if len(snippet) > 400 else "")
                 lines.append(f"- **[S{i}] {ch.citation}** — {snippet}")
 
             lines.append("")
             lines.append("If you add an API key in Streamlit secrets, I can generate a full natural-language answer grounded in these sources.")
-
             answer = "\n".join(lines)
 
             with st.chat_message("assistant"):
