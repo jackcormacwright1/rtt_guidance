@@ -2,7 +2,10 @@ streamlit==1.37.1
 requests==2.32.3
 beautifulsoup4==4.12.3
 pypdf==5.0.1
-numpy==1.26.4
+
+numpy>=1.26.4,<2.0
 faiss-cpu==1.8.0.post1
 sentence-transformers==3.0.1
+
 openai==1.40.6
+
