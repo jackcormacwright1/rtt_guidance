@@ -42,7 +42,7 @@ INDEX_DIR = os.path.join(CACHE_DIR, "index")
 os.makedirs(INDEX_DIR, exist_ok=True)
 
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-DEFAULT_LLM_MODEL = "gpt-4o-mini"
+DEFAULT_LLM_MODEL = "gpt-5.2"
 
 
 # =========================
