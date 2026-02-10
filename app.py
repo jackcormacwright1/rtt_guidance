@@ -409,35 +409,116 @@ with st.sidebar:
         pdf_paths.append(p)
 
     st.divider()
+
+    # =========================
+    # RETRIEVAL SETTINGS
+    # =========================
     st.header("Retrieval settings")
     k = st.slider("Top-K chunks", 4, 15, 8, 1)
-    gate = st.slider("Evidence threshold (cosine similarity)", 0.20, 0.70, 0.38, 0.01)
-    st.caption("If the best match is below the threshold, the bot will refuse (reduces hallucinations).")
+    gate = st.slider(
+        "Evidence threshold (cosine similarity)",
+        0.20, 0.70, 0.38, 0.01
+    )
+    st.caption(
+        "If the best match is below the threshold, the bot will refuse "
+        "(reduces hallucinations)."
+    )
 
     st.divider()
+
+    # =========================
+    # LLM SETTINGS
+    # =========================
     st.header("LLM settings")
-    use_llm = st.toggle("Use LLM to generate answer (needs API key)", value=True)
-    llm_model = st.text_input("Model name", value=DEFAULT_LLM_MODEL)
-    verifier = st.toggle("Run verifier pass (2nd call)", value=True)
+    use_llm = st.toggle(
+        "Use LLM to generate answer (needs API key)",
+        value=True
+    )
+    llm_model = st.text_input(
+        "Model name",
+        value=DEFAULT_LLM_MODEL
+    )
+    verifier = st.toggle(
+        "Run verifier pass (2nd call)",
+        value=True
+    )
 
     st.divider()
+
+    # =========================
+    # API KEY STATUS
+    # =========================
     st.header("API key status")
+
     try:
         secret_key = st.secrets.get("OPENAI_API_KEY", "")
     except Exception:
         secret_key = ""
+
     env_key = os.getenv("OPENAI_API_KEY", "")
 
     st.write("Secrets key:", "✅ detected" if bool(secret_key) else "❌ not found")
     st.write("Env var key:", "✅ detected" if bool(env_key) else "❌ not found")
-    if secret_key or env_key:
-        st.code(f"secrets: {_mask(secret_key)}\nenv:     {_mask(env_key)}")
 
-    if st.session_state.get("_openai_init_error"):
-        st.error(f"OpenAI init error: {st.session_state['_openai_init_error']}")
+    def _mask(k: str) -> str:
+        if not k:
+            return ""
+        return k[:6] + "..." + k[-4:]
+
+    if secret_key or env_key:
+        st.code(
+            f"secrets: {_mask(secret_key)}\n"
+            f"env:     {_mask(env_key)}"
+        )
 
     st.divider()
+
+    # =========================
+    # OPENAI HEALTHCHECK
+    # =========================
+    st.header("OpenAI healthcheck")
+
+    if st.button("Test OpenAI client"):
+        # 1. Can we import openai?
+        try:
+            import openai
+            st.write(
+                "openai package version:",
+                getattr(openai, "__version__", "unknown")
+            )
+        except Exception as e:
+            st.error(f"❌ Failed to import openai: {e}")
+            st.stop()
+
+        # 2. Can we import OpenAI class?
+        try:
+            from openai import OpenAI
+            st.write("OpenAI class import: ✅ ok")
+        except Exception as e:
+            st.error(f"❌ Failed `from openai import OpenAI`: {e}")
+            st.stop()
+
+        # 3. Do we actually have a key at runtime?
+        api_key = secret_key or env_key
+        if not api_key:
+            st.error("❌ No API key available at runtime.")
+            st.stop()
+
+        # 4. Can we create a client and make a trivial call?
+        try:
+            client = OpenAI(api_key=api_key)
+            _ = client.models.list()
+            st.success("✅ OpenAI client works (models.list succeeded)")
+        except Exception as e:
+            st.error(f"❌ OpenAI client initialisation/call failed:\n{e}")
+
+    st.divider()
+
+    # =========================
+    # INDEX MAINTENANCE
+    # =========================
     st.header("Index")
+
     if st.button("Rebuild index"):
         try:
             for fn in os.listdir(INDEX_DIR):
@@ -445,7 +526,6 @@ with st.sidebar:
             st.success("Deleted cached index files. Reload to rebuild.")
         except Exception as e:
             st.error(f"Could not clear cache: {e}")
-
 
 # Build/load index
 with st.spinner("Loading/building index..."):
