@@ -394,19 +394,24 @@ def _mask(k: str) -> str:
     return k[:6] + "..." + k[-4:]
 
 
+NHSE_LINKS = {
+    "Recording-and-reporting-RTT-waiting-times-guidance-v5.2-Feb25.pdf":
+        "https://www.england.nhs.uk/publication/recording-and-reporting-rtt-waiting-times-guidance/",
+
+    "Recording-and-reporting-RTT-waiting-times-guidance-Accompanying-FAQs-v1.4-Feb25.pdf":
+        "https://www.england.nhs.uk/publication/recording-and-reporting-rtt-waiting-times-guidance-accompanying-faqs/"
+}
+
 with st.sidebar:
     st.header("Sources")
+
     st.markdown("**GOV.UK**")
-    st.write(GOVUK_URL)
+    st.markdown(f"[Referral to Treatment Rules Suite (Oct 2022)]({GOVUK_URL})")
 
     st.markdown("**NHSE Guidance Docs**")
-    pdf_paths = []
-    for p in DEFAULT_PDF_PATHS:
-        ok = os.path.exists(p)
-        st.write(p)
-        pdf_paths.append(p)
 
-    st.divider()
+    for filename, url in NHSE_LINKS.items():
+        st.markdown(f"[{filename}]({url})")
 
     k = 4
     gate = 0.38
