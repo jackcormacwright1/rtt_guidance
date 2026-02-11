@@ -2,7 +2,6 @@ import os
 import re
 import json
 import time
-import pickle
 import hashlib
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
@@ -56,6 +55,28 @@ class Chunk:
     url: Optional[str] = None
     page: Optional[int] = None
     heading: Optional[str] = None
+
+
+def chunk_to_dict(c: "Chunk") -> Dict:
+    return {
+        "text": c.text,
+        "source": c.source,
+        "citation": c.citation,
+        "url": c.url,
+        "page": c.page,
+        "heading": c.heading,
+    }
+
+
+def chunk_from_dict(d: Dict) -> "Chunk":
+    return Chunk(
+        text=d.get("text", ""),
+        source=d.get("source", ""),
+        citation=d.get("citation", ""),
+        url=d.get("url"),
+        page=d.get("page"),
+        heading=d.get("heading"),
+    )
 
 
 # =========================
@@ -223,8 +244,57 @@ def load_embedder(model_name: str = EMBED_MODEL_NAME) -> SentenceTransformer:
 
 def _index_paths(source_hash: str) -> Tuple[str, str]:
     idx_path = os.path.join(INDEX_DIR, f"{source_hash}.faiss")
-    meta_path = os.path.join(INDEX_DIR, f"{source_hash}.meta.pkl")
+    meta_path = os.path.join(INDEX_DIR, f"{source_hash}.meta.json")
     return idx_path, meta_path
+
+
+def _load_chunks_meta(meta_path: str) -> List[Chunk]:
+    """
+    Backwards-compatible loader:
+    - Prefer JSON meta
+    - If an old .pkl exists (from previous versions), try to load it
+      and immediately migrate it to JSON.
+    """
+    if meta_path.endswith(".json") and os.path.exists(meta_path):
+        with open(meta_path, "r", encoding="utf-8") as f:
+            return [chunk_from_dict(x) for x in json.load(f)]
+
+    legacy_pkl = meta_path.replace(".meta.json", ".meta.pkl")
+    if os.path.exists(legacy_pkl):
+        # Try to load legacy pickle; if it fails, fall through to rebuild.
+        try:
+            import pickle
+            with open(legacy_pkl, "rb") as f:
+                legacy = pickle.load(f)
+            # legacy might already be Chunk objects or dicts
+            out: List[Chunk] = []
+            for item in legacy:
+                if isinstance(item, Chunk):
+                    out.append(item)
+                elif isinstance(item, dict):
+                    out.append(chunk_from_dict(item))
+                else:
+                    # best-effort: skip unknown items
+                    pass
+
+            # migrate to JSON for next time
+            try:
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    json.dump([chunk_to_dict(c) for c in out], f, ensure_ascii=False)
+            except Exception:
+                pass
+
+            return out
+        except Exception:
+            return []
+
+    return []
+
+
+def _save_chunks_meta(meta_path: str, chunks: List[Chunk]) -> None:
+    os.makedirs(os.path.dirname(meta_path), exist_ok=True)
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump([chunk_to_dict(c) for c in chunks], f, ensure_ascii=False)
 
 
 def build_or_load_index(url: str, pdf_paths: List[str]) -> Tuple[faiss.Index, List[Chunk], str]:
@@ -233,26 +303,31 @@ def build_or_load_index(url: str, pdf_paths: List[str]) -> Tuple[faiss.Index, Li
 
     embedder = load_embedder()
 
-    if os.path.exists(idx_path) and os.path.exists(meta_path):
+    if os.path.exists(idx_path) and (os.path.exists(meta_path) or os.path.exists(meta_path.replace(".meta.json", ".meta.pkl"))):
         index = faiss.read_index(idx_path)
-        with open(meta_path, "rb") as f:
-            chunks = pickle.load(f)
-        return index, chunks, source_hash
+        chunks = _load_chunks_meta(meta_path)
+        if chunks:
+            return index, chunks, source_hash
+        # if meta load failed, rebuild below
 
     chunks = build_chunks(url, pdf_paths)
     if not chunks:
         raise RuntimeError("No chunks found. Check the URL and PDF paths.")
 
     texts = [c.text for c in chunks]
-    embs = embedder.encode(texts, show_progress_bar=False, convert_to_numpy=True, normalize_embeddings=True)
+    embs = embedder.encode(
+        texts,
+        show_progress_bar=False,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    )
 
     dim = embs.shape[1]
     index = faiss.IndexFlatIP(dim)  # cosine similarity because vectors are normalized
     index.add(embs.astype(np.float32))
 
     faiss.write_index(index, idx_path)
-    with open(meta_path, "wb") as f:
-        pickle.dump(chunks, f)
+    _save_chunks_meta(meta_path, chunks)
 
     return index, chunks, source_hash
 
@@ -294,7 +369,6 @@ def _openai_client():
 
         return OpenAI(api_key=api_key)
     except Exception as e:
-        # Show the reason once (helps debugging in Cloud)
         try:
             st.session_state["_openai_init_error"] = str(e)
         except Exception:
@@ -388,11 +462,6 @@ def call_llm_verify(answer: str, evidence: List[Tuple[Chunk, float]], model: str
 # =========================
 st.title("RTT Guidance Bot")
 
-def _mask(k: str) -> str:
-    if not k:
-        return ""
-    return k[:6] + "..." + k[-4:]
-
 
 NHSE_LINKS = {
     "Recording-and-reporting-RTT-waiting-times-guidance-v5.2-Feb25.pdf":
@@ -401,9 +470,9 @@ NHSE_LINKS = {
     "Recording-and-reporting-RTT-waiting-times-guidance-Accompanying-FAQs-v1.4-Feb25.pdf":
         "https://www.england.nhs.uk/statistics/wp-content/uploads/sites/2/2025/02/Recording-and-reporting-RTT-waiting-times-guidance-Accompanying-FAQs-v1.4-Feb25.pdf"
 }
-pdf_paths = [] 
-for p in DEFAULT_PDF_PATHS: 
-    ok = os.path.exists(p) 
+
+pdf_paths = []
+for p in DEFAULT_PDF_PATHS:
     pdf_paths.append(p)
 
 with st.sidebar:
@@ -413,7 +482,6 @@ with st.sidebar:
     st.markdown(f"[Referral to Treatment Rules Suite]({GOVUK_URL})")
 
     st.markdown("**NHSE Guidance Docs**")
-
     for filename, url in NHSE_LINKS.items():
         st.markdown(f"[{filename}]({url})")
 
@@ -423,11 +491,13 @@ with st.sidebar:
     llm_model = DEFAULT_LLM_MODEL
     verifier = True
 
+
 # Build/load index
 with st.spinner("Building index..."):
     index, chunks, source_hash = build_or_load_index(GOVUK_URL, pdf_paths)
 
-st.success(f"Ready")
+st.success("Ready")
+
 
 # Chat state
 if "messages" not in st.session_state:
