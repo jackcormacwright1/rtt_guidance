@@ -410,7 +410,7 @@ with st.sidebar:
     st.header("Sources")
 
     st.markdown("**GOV.UK**")
-    st.markdown(f"[Referral to Treatment Rules Suite (Oct 2022)]({GOVUK_URL})")
+    st.markdown(f"[Referral to Treatment Rules Suite]({GOVUK_URL})")
 
     st.markdown("**NHSE Guidance Docs**")
 
