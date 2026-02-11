@@ -396,10 +396,10 @@ def _mask(k: str) -> str:
 
 NHSE_LINKS = {
     "Recording-and-reporting-RTT-waiting-times-guidance-v5.2-Feb25.pdf":
-        "https://www.england.nhs.uk/publication/recording-and-reporting-rtt-waiting-times-guidance/",
+        "https://www.england.nhs.uk/statistics/wp-content/uploads/sites/2/2025/10/",
 
     "Recording-and-reporting-RTT-waiting-times-guidance-Accompanying-FAQs-v1.4-Feb25.pdf":
-        "https://www.england.nhs.uk/publication/recording-and-reporting-rtt-waiting-times-guidance-accompanying-faqs/"
+        "https://www.england.nhs.uk/statistics/wp-content/uploads/sites/2/2025/02/"
 }
 pdf_paths = [] 
 for p in DEFAULT_PDF_PATHS: 
