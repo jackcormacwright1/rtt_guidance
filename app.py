@@ -401,6 +401,10 @@ NHSE_LINKS = {
     "Recording-and-reporting-RTT-waiting-times-guidance-Accompanying-FAQs-v1.4-Feb25.pdf":
         "https://www.england.nhs.uk/publication/recording-and-reporting-rtt-waiting-times-guidance-accompanying-faqs/"
 }
+pdf_paths = [] 
+for p in DEFAULT_PDF_PATHS: 
+    ok = os.path.exists(p) 
+    pdf_paths.append(p)
 
 with st.sidebar:
     st.header("Sources")
