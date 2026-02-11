@@ -20,7 +20,7 @@ from sentence_transformers import SentenceTransformer
 # =========================
 # CONFIG / SECRETS
 # =========================
-st.set_page_config(page_title="RTT Policy Chatbot", layout="wide")
+st.set_page_config(page_title="RTT Chatbot", layout="wide")
 
 # Robust secrets -> env (Streamlit Cloud secrets do NOT always appear as env vars)
 try:
@@ -418,14 +418,14 @@ with st.sidebar:
 with st.spinner("Building index..."):
     index, chunks, source_hash = build_or_load_index(GOVUK_URL, pdf_paths)
 
-st.success(f"Index ready.")
+st.success(f"Ready")
 
 # Chat state
 if "messages" not in st.session_state:
     st.session_state.messages = [
         {
             "role": "assistant",
-            "content": "Ask me RTT rules questions (clock starts/stops, DNAs, active monitoring, etc.). I will cite the sources I used.",
+            "content": "Ask me RTT questions and I will answer based on the national guidance.",
         }
     ]
 
@@ -434,7 +434,7 @@ for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-prompt = st.chat_input("Ask a question about RTT rules / recording and reporting...")
+prompt = st.chat_input("Ask a question about RTT...")
 
 if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt})
