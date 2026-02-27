@@ -27,9 +27,6 @@ from sentence_transformers import SentenceTransformer
 # =========================
 st.set_page_config(page_title="RTT Chatbot", layout="wide")
 
-# Robust secrets -> env (Streamlit Cloud)
-# - If you set OPENAI_API_KEY in Streamlit secrets, we also set it as an env var
-#   because some OpenAI client libraries read from environment.
 try:
     key = st.secrets.get("OPENAI_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "")
     if key:
@@ -45,7 +42,6 @@ DEFAULT_PDF_PATHS = [
 ]
 
 # Local access policy (Word document)
-# Put the file in the ./data folder. We try a few common extensions.
 DEFAULT_DOCX_PATHS = [
     "data/South East London Access Policy.docx",
     "data/South East London Access Policy.DOCX",
@@ -160,7 +156,6 @@ def fetch_govuk_article(url: str) -> Dict[str, str]:
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # GOV.UK pages usually have a div.govuk-body with headings and paragraphs
     content = soup.find("div", class_=re.compile(r"govuk-body"))
     if not content:
         content = soup
@@ -169,7 +164,6 @@ def fetch_govuk_article(url: str) -> Dict[str, str]:
     current_heading = "GOV.UK"
     sections[current_heading] = []
 
-    # walk through headings and paragraphs
     for el in content.find_all(["h2", "h3", "h4", "p", "li"]):
         tag = el.name.lower()
         txt = _clean_text(el.get_text(" ", strip=True))
@@ -283,7 +277,7 @@ def build_chunks(url: str, pdf_paths: List[str], docx_paths: List[str]) -> List[
                 )
             )
 
-    # Local access policy (Word document)
+    # Access policy (Word document)
     for docx_path in docx_paths:
         if not os.path.exists(docx_path):
             continue
@@ -324,18 +318,11 @@ def _index_paths(source_hash: str) -> Tuple[str, str]:
 
 
 def _load_chunks_meta(meta_path: str) -> List[Chunk]:
-    """
-    Backwards-compatible loader:
-    - Prefer JSON meta
-    - If an old .pkl exists (from previous versions), try to load it
-      and immediately migrate it to JSON.
-    """
     if meta_path.endswith(".json") and os.path.exists(meta_path):
         with open(meta_path, "r", encoding="utf-8") as f:
             raw = json.load(f)
         return [Chunk(**item) for item in raw]
 
-    # Legacy (optional) – if you ever used pickle before
     pkl_path = meta_path.replace(".meta.json", ".meta.pkl")
     if os.path.exists(pkl_path):
         try:
@@ -424,7 +411,7 @@ def retrieve_chunks(
 
 
 # =========================
-# "LLM" / RESPONSE GENERATION
+# LLM / RESPONSE GENERATION
 # =========================
 def format_context_for_prompt(retrieved: List[Tuple[Chunk, float]]) -> str:
     parts = []
@@ -442,10 +429,7 @@ def answer_from_context(
     use_llm: bool = True,
     llm_model: str = DEFAULT_LLM_MODEL,
 ) -> Tuple[str, List[str]]:
-    """
-    If use_llm is False, returns a simple extractive answer (best-effort).
-    If use_llm is True, expects OpenAI API key to be configured via secrets/env.
-    """
+    
     sources_used = [ch.citation for ch, _ in retrieved]
 
     context = format_context_for_prompt(retrieved)
@@ -456,8 +440,6 @@ def answer_from_context(
         top = retrieved[0][0]
         return f"Best match from sources:\n\n{top.text}\n\nSources:\n- " + "\n- ".join(sources_used), sources_used
 
-    # Minimal OpenAI-compatible chat completion call using requests (no SDK dependency).
-    # This keeps the app lightweight; you can swap in the official SDK if preferred.
     api_key = os.environ.get("OPENAI_API_KEY", "")
     if not api_key:
         return (
@@ -480,8 +462,6 @@ def answer_from_context(
         "Cite sources by referencing [S1], [S2], etc inline."
     )
 
-    # NOTE: This is a placeholder endpoint format. If you use a different provider or
-    # an official SDK, update accordingly. The rest of the app (index/retrieval) stays the same.
     try:
         resp = requests.post(
             "https://api.openai.com/v1/chat/completions",
@@ -508,9 +488,8 @@ def answer_from_context(
 # STREAMLIT UI
 # =========================
 st.title("RTT Guidance Chatbot")
-st.caption("Retrieval over GOV.UK Rules Suite + NHSE RTT Guidance PDFs + Local Access Policy (.docx)")
+st.caption("GOV.UK Rules Suite + NHSE RTT Guidance PDFs + Access Policy (.docx)")
 
-# A small set of links shown in sidebar (purely informational)
 NHSE_LINKS = {
     "Recording and reporting RTT waiting times guidance v5.2 (Feb 2025)": "https://www.england.nhs.uk/statistics/wp-content/uploads/sites/2/2025/02/Recording-and-reporting-RTT-waiting-times-guidance-v5.2-Feb25.pdf",
     "Accompanying FAQs v1.4 (Feb 2025)": "https://www.england.nhs.uk/statistics/wp-content/uploads/sites/2/2025/02/Recording-and-reporting-RTT-waiting-times-guidance-Accompanying-FAQs-v1.4-Feb25.pdf",
@@ -535,14 +514,23 @@ with st.sidebar:
     for filename, url in NHSE_LINKS.items():
         st.markdown(f"[{filename}]({url})")
 
-    st.markdown("**Access Policy (local .docx)**")
-    if Document is None:
-        st.info("python-docx isn't installed, so the access policy won't be indexed. Add `python-docx` to requirements.txt.")
+    st.markdown("**Access Policy (.docx)**")
+    
     if not docx_paths:
-        st.warning("No access policy .docx found in ./data (expected: 'South East London Access Policy.docx').")
+        st.warning("No access policy .docx found in ./data.")
     else:
         for p in docx_paths:
-            st.markdown(f"- {os.path.basename(p)}")
+            filename = os.path.basename(p)
+    
+            with open(p, "rb") as f:
+                file_bytes = f.read()
+    
+            st.download_button(
+                label=f"{filename}",
+                data=file_bytes,
+                file_name=filename,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
 
     k = 4
     gate = 0.38
@@ -557,15 +545,14 @@ with st.spinner("Building index..."):
 
 st.success("Ready")
 
-
 # Chat state
 if "messages" not in st.session_state:
     st.session_state.messages = [
         {
             "role": "assistant",
             "content": (
-                "Ask me a question about RTT rules/guidance. I’ll answer using the indexed sources.\n\n"
-                "Tip: be specific (e.g. 'How do pauses work after patient defers appointment?')."
+                "Ask me a question about RTT rules/guidance. I’ll answer using the provided sources.\n\n"
+                "Please be specific (e.g. 'Should trauma pathways be included in RTT?')."
             ),
         }
     ]
@@ -586,7 +573,7 @@ if prompt:
     embedder = load_embedder()
     retrieved = retrieve_chunks(prompt, index=index, chunks=chunks, embedder=embedder, k=k)
 
-    # Optional gate: if top score is low, you can warn the user
+    # if top score is low warn the user
     if retrieved and retrieved[0][1] < gate:
         notice = (
             f"I found some potentially relevant text, but similarity is low (top score {retrieved[0][1]:.2f}). "
