@@ -10,3 +10,4 @@ sentence-transformers==3.0.1
 
 openai==1.40.6
 
+python-docx
