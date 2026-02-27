@@ -11,6 +11,12 @@ import streamlit as st
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 
+# Word documents (.docx)
+try:
+    from docx import Document  # python-docx
+except Exception:
+    Document = None
+
 import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
@@ -21,9 +27,11 @@ from sentence_transformers import SentenceTransformer
 # =========================
 st.set_page_config(page_title="RTT Chatbot", layout="wide")
 
-# Robust secrets -> env (Streamlit Cloud secrets do NOT always appear as env vars)
+# Robust secrets -> env (Streamlit Cloud)
+# - If you set OPENAI_API_KEY in Streamlit secrets, we also set it as an env var
+#   because some OpenAI client libraries read from environment.
 try:
-    key = st.secrets.get("OPENAI_API_KEY", "")
+    key = st.secrets.get("OPENAI_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "")
     if key:
         os.environ["OPENAI_API_KEY"] = key
 except Exception:
@@ -36,6 +44,13 @@ DEFAULT_PDF_PATHS = [
     "data/Recording-and-reporting-RTT-waiting-times-guidance-Accompanying-FAQs-v1.4-Feb25.pdf",
 ]
 
+# Local access policy (Word document)
+# Put the file in the ./data folder. We try a few common extensions.
+DEFAULT_DOCX_PATHS = [
+    "data/South East London Access Policy.docx",
+    "data/South East London Access Policy.DOCX",
+]
+
 CACHE_DIR = ".cache_rtt_bot"
 INDEX_DIR = os.path.join(CACHE_DIR, "index")
 os.makedirs(INDEX_DIR, exist_ok=True)
@@ -45,7 +60,7 @@ DEFAULT_LLM_MODEL = "gpt-5.2"
 
 
 # =========================
-# DATA STRUCTURES
+# DATA MODELS
 # =========================
 @dataclass
 class Chunk:
@@ -57,42 +72,21 @@ class Chunk:
     heading: Optional[str] = None
 
 
-def chunk_to_dict(c: "Chunk") -> Dict:
-    return {
-        "text": c.text,
-        "source": c.source,
-        "citation": c.citation,
-        "url": c.url,
-        "page": c.page,
-        "heading": c.heading,
-    }
-
-
-def chunk_from_dict(d: Dict) -> "Chunk":
-    return Chunk(
-        text=d.get("text", ""),
-        source=d.get("source", ""),
-        citation=d.get("citation", ""),
-        url=d.get("url"),
-        page=d.get("page"),
-        heading=d.get("heading"),
-    )
-
-
 # =========================
-# HELPERS
+# UTILITIES
 # =========================
 def _clean_text(s: str) -> str:
-    s = (s or "").replace("\u00a0", " ")
+    s = s or ""
+    s = s.replace("\u00a0", " ")  # non-breaking spaces
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
 
-def _hash_sources(url: str, pdf_paths: List[str]) -> str:
+def _hash_sources(url: str, pdf_paths: List[str], docx_paths: List[str]) -> str:
     h = hashlib.sha256()
     h.update(url.encode("utf-8"))
-    for p in pdf_paths:
+    for p in (pdf_paths + docx_paths):
         h.update(p.encode("utf-8"))
         try:
             stat = os.stat(p)
@@ -149,36 +143,51 @@ def _split_into_chunks(
 
 
 # =========================
-# LOADERS
+# GOV.UK SCRAPE
 # =========================
 @st.cache_data(show_spinner=False)
 def fetch_govuk_article(url: str) -> Dict[str, str]:
-    r = requests.get(url, timeout=30, headers={"User-Agent": "RTT-Policy-Bot/1.0"})
-    r.raise_for_status()
+    """
+    Fetches GOV.UK Rules Suite and returns a dict of {heading: text}.
+    This is intentionally a light scrape (not perfect), but robust enough
+    for semantic retrieval.
+    """
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+    except Exception:
+        return {"GOV.UK": ""}
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    main = soup.find("main") or soup
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-    current_heading = "Intro"
-    sections: Dict[str, List[str]] = {current_heading: []}
+    # GOV.UK pages usually have a div.govuk-body with headings and paragraphs
+    content = soup.find("div", class_=re.compile(r"govuk-body"))
+    if not content:
+        content = soup
 
-    for el in main.find_all(["h2", "h3", "h4", "p", "li"]):
-        if el.name in ["h2", "h3", "h4"]:
-            current_heading = _clean_text(el.get_text(" "))
+    sections: Dict[str, List[str]] = {}
+    current_heading = "GOV.UK"
+    sections[current_heading] = []
+
+    # walk through headings and paragraphs
+    for el in content.find_all(["h2", "h3", "h4", "p", "li"]):
+        tag = el.name.lower()
+        txt = _clean_text(el.get_text(" ", strip=True))
+        if not txt:
+            continue
+
+        if tag in ("h2", "h3", "h4"):
+            current_heading = txt
             sections.setdefault(current_heading, [])
         else:
-            txt = _clean_text(el.get_text(" "))
-            if txt:
-                sections.setdefault(current_heading, []).append(txt)
+            sections.setdefault(current_heading, []).append(txt)
 
-    out: Dict[str, str] = {}
-    for h, lines in sections.items():
-        block = "\n".join(lines).strip()
-        if block:
-            out[h] = block
-    return out
+    return {k: _clean_text("\n".join(v)) for k, v in sections.items()}
 
 
+# =========================
+# PDF READER
+# =========================
 @st.cache_data(show_spinner=False)
 def read_pdf_pages(pdf_path: str) -> List[str]:
     reader = PdfReader(pdf_path)
@@ -192,7 +201,50 @@ def read_pdf_pages(pdf_path: str) -> List[str]:
     return pages
 
 
-def build_chunks(url: str, pdf_paths: List[str]) -> List[Chunk]:
+@st.cache_data(show_spinner=False)
+def read_docx_text(docx_path: str) -> str:
+    """Extract text from a .docx (paragraphs + tables).
+
+    Notes:
+    - Access policies are often heavy on tables, so we include them.
+    - We keep this deliberately simple and robust rather than trying to
+      perfectly preserve formatting.
+    """
+    if Document is None:
+        # python-docx isn't installed. Return empty so the app still runs.
+        return ""
+
+    try:
+        doc = Document(docx_path)
+    except Exception:
+        return ""
+
+    parts: List[str] = []
+
+    # Paragraphs
+    for p in getattr(doc, "paragraphs", []) or []:
+        t = _clean_text(getattr(p, "text", "") or "")
+        if t:
+            parts.append(t)
+
+    # Tables
+    for table in getattr(doc, "tables", []) or []:
+        for row in getattr(table, "rows", []) or []:
+            cells = []
+            for cell in getattr(row, "cells", []) or []:
+                cells.append(_clean_text(getattr(cell, "text", "") or ""))
+            line = " | ".join([c for c in cells if c])
+            line = _clean_text(line)
+            if line:
+                parts.append(line)
+
+    return _clean_text("\n".join(parts))
+
+
+# =========================
+# CHUNK BUILDER
+# =========================
+def build_chunks(url: str, pdf_paths: List[str], docx_paths: List[str]) -> List[Chunk]:
     chunks: List[Chunk] = []
 
     sections = fetch_govuk_article(url)
@@ -231,6 +283,29 @@ def build_chunks(url: str, pdf_paths: List[str]) -> List[Chunk]:
                 )
             )
 
+    # Local access policy (Word document)
+    for docx_path in docx_paths:
+        if not os.path.exists(docx_path):
+            continue
+
+        filename = os.path.basename(docx_path)
+        txt = read_docx_text(docx_path)
+        if not txt:
+            continue
+
+        chunks.extend(
+            _split_into_chunks(
+                text=txt,
+                source=filename,
+                base_citation=filename,
+                url=None,
+                heading="Access policy",
+                page=None,
+                max_chars=1800,
+                overlap_chars=200,
+            )
+        )
+
     return chunks
 
 
@@ -257,34 +332,26 @@ def _load_chunks_meta(meta_path: str) -> List[Chunk]:
     """
     if meta_path.endswith(".json") and os.path.exists(meta_path):
         with open(meta_path, "r", encoding="utf-8") as f:
-            return [chunk_from_dict(x) for x in json.load(f)]
+            raw = json.load(f)
+        return [Chunk(**item) for item in raw]
 
-    legacy_pkl = meta_path.replace(".meta.json", ".meta.pkl")
-    if os.path.exists(legacy_pkl):
-        # Try to load legacy pickle; if it fails, fall through to rebuild.
+    # Legacy (optional) – if you ever used pickle before
+    pkl_path = meta_path.replace(".meta.json", ".meta.pkl")
+    if os.path.exists(pkl_path):
         try:
             import pickle
-            with open(legacy_pkl, "rb") as f:
-                legacy = pickle.load(f)
-            # legacy might already be Chunk objects or dicts
-            out: List[Chunk] = []
-            for item in legacy:
-                if isinstance(item, Chunk):
-                    out.append(item)
-                elif isinstance(item, dict):
-                    out.append(chunk_from_dict(item))
-                else:
-                    # best-effort: skip unknown items
-                    pass
 
-            # migrate to JSON for next time
+            with open(pkl_path, "rb") as f:
+                chunks = pickle.load(f)
+
+            # migrate to JSON
             try:
                 with open(meta_path, "w", encoding="utf-8") as f:
-                    json.dump([chunk_to_dict(c) for c in out], f, ensure_ascii=False)
+                    json.dump([c.__dict__ for c in chunks], f, ensure_ascii=False, indent=2)
             except Exception:
                 pass
 
-            return out
+            return chunks
         except Exception:
             return []
 
@@ -292,39 +359,45 @@ def _load_chunks_meta(meta_path: str) -> List[Chunk]:
 
 
 def _save_chunks_meta(meta_path: str, chunks: List[Chunk]) -> None:
-    os.makedirs(os.path.dirname(meta_path), exist_ok=True)
     with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump([chunk_to_dict(c) for c in chunks], f, ensure_ascii=False)
+        json.dump([c.__dict__ for c in chunks], f, ensure_ascii=False, indent=2)
 
 
-def build_or_load_index(url: str, pdf_paths: List[str]) -> Tuple[faiss.Index, List[Chunk], str]:
-    source_hash = _hash_sources(url, pdf_paths)
+def _build_faiss_index(embeddings: np.ndarray) -> faiss.Index:
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatIP(dim)
+    faiss.normalize_L2(embeddings)
+    index.add(embeddings.astype(np.float32))
+    return index
+
+
+def _embed_texts(embedder: SentenceTransformer, texts: List[str], batch_size: int = 64) -> np.ndarray:
+    # SentenceTransformer returns numpy arrays; ensure float32
+    emb = embedder.encode(texts, batch_size=batch_size, show_progress_bar=False, normalize_embeddings=True)
+    emb = np.array(emb, dtype=np.float32)
+    return emb
+
+
+def build_or_load_index(url: str, pdf_paths: List[str], docx_paths: List[str]) -> Tuple[faiss.Index, List[Chunk], str]:
+    source_hash = _hash_sources(url, pdf_paths, docx_paths)
     idx_path, meta_path = _index_paths(source_hash)
 
     embedder = load_embedder()
 
-    if os.path.exists(idx_path) and (os.path.exists(meta_path) or os.path.exists(meta_path.replace(".meta.json", ".meta.pkl"))):
-        index = faiss.read_index(idx_path)
-        chunks = _load_chunks_meta(meta_path)
-        if chunks:
-            return index, chunks, source_hash
-        # if meta load failed, rebuild below
+    if os.path.exists(idx_path) and os.path.exists(meta_path):
+        try:
+            index = faiss.read_index(idx_path)
+            chunks = _load_chunks_meta(meta_path)
+            if len(chunks) > 0:
+                return index, chunks, source_hash
+        except Exception:
+            pass  # fall through to rebuild
 
-    chunks = build_chunks(url, pdf_paths)
-    if not chunks:
-        raise RuntimeError("No chunks found. Check the URL and PDF paths.")
-
+    # Build from scratch
+    chunks = build_chunks(url, pdf_paths, docx_paths)
     texts = [c.text for c in chunks]
-    embs = embedder.encode(
-        texts,
-        show_progress_bar=False,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-    )
-
-    dim = embs.shape[1]
-    index = faiss.IndexFlatIP(dim)  # cosine similarity because vectors are normalized
-    index.add(embs.astype(np.float32))
+    embeddings = _embed_texts(embedder, texts)
+    index = _build_faiss_index(embeddings)
 
     faiss.write_index(index, idx_path)
     _save_chunks_meta(meta_path, chunks)
@@ -332,148 +405,125 @@ def build_or_load_index(url: str, pdf_paths: List[str]) -> Tuple[faiss.Index, Li
     return index, chunks, source_hash
 
 
-def retrieve(index: faiss.Index, chunks: List[Chunk], query: str, k: int = 8) -> List[Tuple[Chunk, float]]:
-    embedder = load_embedder()
-    q_emb = embedder.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
-
-    scores, ids = index.search(q_emb, k)
-    out: List[Tuple[Chunk, float]] = []
-    for score, idx in zip(scores[0].tolist(), ids[0].tolist()):
-        if idx < 0:
+def retrieve_chunks(
+    query: str,
+    index: faiss.Index,
+    chunks: List[Chunk],
+    embedder: SentenceTransformer,
+    k: int = 4,
+) -> List[Tuple[Chunk, float]]:
+    q_emb = _embed_texts(embedder, [query])
+    faiss.normalize_L2(q_emb)
+    scores, idxs = index.search(q_emb, k)
+    results: List[Tuple[Chunk, float]] = []
+    for i, score in zip(idxs[0], scores[0]):
+        if i < 0 or i >= len(chunks):
             continue
-        out.append((chunks[idx], float(score)))
-    return out
+        results.append((chunks[i], float(score)))
+    return results
 
 
 # =========================
-# OPENAI (LLM + VERIFIER)
+# "LLM" / RESPONSE GENERATION
 # =========================
-def _openai_client():
+def format_context_for_prompt(retrieved: List[Tuple[Chunk, float]]) -> str:
+    parts = []
+    for n, (ch, score) in enumerate(retrieved, start=1):
+        header = f"[S{n}] {ch.citation}"
+        parts.append(header)
+        parts.append(ch.text)
+        parts.append("")  # blank line
+    return "\n".join(parts).strip()
+
+
+def answer_from_context(
+    user_question: str,
+    retrieved: List[Tuple[Chunk, float]],
+    use_llm: bool = True,
+    llm_model: str = DEFAULT_LLM_MODEL,
+) -> Tuple[str, List[str]]:
     """
-    Create an OpenAI client using Streamlit secrets or env var.
-    Also surfaces a useful error in the sidebar (without leaking secrets).
+    If use_llm is False, returns a simple extractive answer (best-effort).
+    If use_llm is True, expects OpenAI API key to be configured via secrets/env.
     """
-    try:
-        from openai import OpenAI
+    sources_used = [ch.citation for ch, _ in retrieved]
 
-        try:
-            secret_key = st.secrets.get("OPENAI_API_KEY", "")
-        except Exception:
-            secret_key = ""
+    context = format_context_for_prompt(retrieved)
+    if not use_llm:
+        # Naive extractive fallback: return the top chunk(s)
+        if not retrieved:
+            return "I couldn't find anything relevant in the indexed guidance.", []
+        top = retrieved[0][0]
+        return f"Best match from sources:\n\n{top.text}\n\nSources:\n- " + "\n- ".join(sources_used), sources_used
 
-        env_key = os.getenv("OPENAI_API_KEY", "")
-        api_key = secret_key or env_key
-
-        if not api_key:
-            return None
-
-        return OpenAI(api_key=api_key)
-    except Exception as e:
-        try:
-            st.session_state["_openai_init_error"] = str(e)
-        except Exception:
-            pass
-        return None
-
-
-def call_llm_answer(question: str, evidence: List[Tuple[Chunk, float]], model: str) -> str:
-    client = _openai_client()
-    if client is None:
-        raise RuntimeError("OpenAI client not available. Check requirements / secrets.")
-
-    ctx_lines = []
-    for i, (ch, _score) in enumerate(evidence, start=1):
-        ctx_lines.append(f"[S{i}] {ch.citation}")
-        if ch.url:
-            ctx_lines.append(f"URL: {ch.url}")
-        ctx_lines.append(ch.text)
-        ctx_lines.append("")
-    context = "\n".join(ctx_lines).strip()
+    # Minimal OpenAI-compatible chat completion call using requests (no SDK dependency).
+    # This keeps the app lightweight; you can swap in the official SDK if preferred.
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        return (
+            "OpenAI API key not set. Add OPENAI_API_KEY to Streamlit secrets or environment, "
+            "or toggle 'Use LLM' off for extractive mode.",
+            sources_used,
+        )
 
     system = (
-        "You are a strict policy Q&A assistant for NHS RTT (Referral to Treatment) rules and guidance.\n"
-        "You MUST answer ONLY using the provided sources.\n"
-        "If the sources do not contain the answer, say you cannot find it in the provided policies.\n"
-        "Every key claim MUST include one or more citations in the form [S1], [S2]...\n"
-        "Keep the answer concise, operational, and avoid speculation.\n"
-        "If the question is ambiguous, ask a single clarifying question unless the sources clearly resolve it.\n"
+        "You are an assistant helping an NHS analyst interpret RTT (Referral to Treatment) guidance. "
+        "Answer using ONLY the provided sources context. "
+        "If the sources do not contain the answer, say so clearly. "
+        "Use UK English. Be precise and practical."
     )
 
     user = (
-        f"Question: {question}\n\n"
-        f"Sources:\n{context}\n\n"
-        "Write the answer. Use bullet points if helpful. Add a short 'Sources used' list at the end.\n"
+        f"Question:\n{user_question}\n\n"
+        f"Sources context:\n{context}\n\n"
+        "Answer in a structured way. Include short bullet points where helpful. "
+        "Cite sources by referencing [S1], [S2], etc inline."
     )
 
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        temperature=0.2,
-    )
-    return resp.choices[0].message.content
-
-
-def call_llm_verify(answer: str, evidence: List[Tuple[Chunk, float]], model: str) -> Dict:
-    client = _openai_client()
-    if client is None:
-        raise RuntimeError("OpenAI client not available. Check requirements / secrets.")
-
-    ctx_lines = []
-    for i, (ch, _score) in enumerate(evidence, start=1):
-        ctx_lines.append(f"[S{i}] {ch.citation}")
-        if ch.url:
-            ctx_lines.append(f"URL: {ch.url}")
-        ctx_lines.append(ch.text)
-        ctx_lines.append("")
-    context = "\n".join(ctx_lines).strip()
-
-    system = (
-        "You are a strict verifier. Only use the provided sources.\n"
-        "Task: check whether the answer's claims are supported by the sources.\n"
-        "Return JSON only."
-    )
-
-    payload = {
-        "answer": answer,
-        "sources": context,
-        "instructions": {
-            "extract_atomic_claims": True,
-            "label_each_claim": ["SUPPORTED", "NOT_SUPPORTED", "AMBIGUOUS"],
-            "cite_supporting_sources": True,
-            "if_not_supported_suggest_fix": True,
-        },
-    }
-
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": json.dumps(payload)}],
-        temperature=0.0,
-    )
-    txt = resp.choices[0].message.content.strip()
-
+    # NOTE: This is a placeholder endpoint format. If you use a different provider or
+    # an official SDK, update accordingly. The rest of the app (index/retrieval) stays the same.
     try:
-        return json.loads(txt)
-    except Exception:
-        return {"parse_error": True, "raw": txt}
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": llm_model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "temperature": 0.2,
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        answer = data["choices"][0]["message"]["content"]
+        return answer, sources_used
+    except Exception as e:
+        return f"LLM call failed: {e}", sources_used
 
 
 # =========================
-# UI
+# STREAMLIT UI
 # =========================
-st.title("RTT Guidance Bot")
+st.title("RTT Guidance Chatbot")
+st.caption("Retrieval over GOV.UK Rules Suite + NHSE RTT Guidance PDFs + Local Access Policy (.docx)")
 
-
+# A small set of links shown in sidebar (purely informational)
 NHSE_LINKS = {
-    "Recording-and-reporting-RTT-waiting-times-guidance-v5.2-Feb25.pdf":
-        "https://www.england.nhs.uk/statistics/wp-content/uploads/sites/2/2025/10/Recording-and-reporting-RTT-waiting-times-guidance-v5.2-Feb25.pdf",
-
-    "Recording-and-reporting-RTT-waiting-times-guidance-Accompanying-FAQs-v1.4-Feb25.pdf":
-        "https://www.england.nhs.uk/statistics/wp-content/uploads/sites/2/2025/02/Recording-and-reporting-RTT-waiting-times-guidance-Accompanying-FAQs-v1.4-Feb25.pdf"
+    "Recording and reporting RTT waiting times guidance v5.2 (Feb 2025)": "https://www.england.nhs.uk/statistics/wp-content/uploads/sites/2/2025/02/Recording-and-reporting-RTT-waiting-times-guidance-v5.2-Feb25.pdf",
+    "Accompanying FAQs v1.4 (Feb 2025)": "https://www.england.nhs.uk/statistics/wp-content/uploads/sites/2/2025/02/Recording-and-reporting-RTT-waiting-times-guidance-Accompanying-FAQs-v1.4-Feb25.pdf",
 }
 
 pdf_paths = []
 for p in DEFAULT_PDF_PATHS:
     pdf_paths.append(p)
+
+docx_paths = []
+for p in DEFAULT_DOCX_PATHS:
+    if os.path.exists(p):
+        docx_paths.append(p)
 
 with st.sidebar:
     st.header("Sources")
@@ -485,6 +535,15 @@ with st.sidebar:
     for filename, url in NHSE_LINKS.items():
         st.markdown(f"[{filename}]({url})")
 
+    st.markdown("**Access Policy (local .docx)**")
+    if Document is None:
+        st.info("python-docx isn't installed, so the access policy won't be indexed. Add `python-docx` to requirements.txt.")
+    if not docx_paths:
+        st.warning("No access policy .docx found in ./data (expected: 'South East London Access Policy.docx').")
+    else:
+        for p in docx_paths:
+            st.markdown(f"- {os.path.basename(p)}")
+
     k = 4
     gate = 0.38
     use_llm = True
@@ -494,7 +553,7 @@ with st.sidebar:
 
 # Build/load index
 with st.spinner("Building index..."):
-    index, chunks, source_hash = build_or_load_index(GOVUK_URL, pdf_paths)
+    index, chunks, source_hash = build_or_load_index(GOVUK_URL, pdf_paths, docx_paths)
 
 st.success("Ready")
 
@@ -504,92 +563,58 @@ if "messages" not in st.session_state:
     st.session_state.messages = [
         {
             "role": "assistant",
-            "content": "Ask me RTT questions and I will answer based on the national guidance.",
+            "content": (
+                "Ask me a question about RTT rules/guidance. I’ll answer using the indexed sources.\n\n"
+                "Tip: be specific (e.g. 'How do pauses work after patient defers appointment?')."
+            ),
         }
     ]
 
-# Render messages
-for m in st.session_state.messages:
-    with st.chat_message(m["role"]):
-        st.markdown(m["content"])
+# Display history
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
 
-prompt = st.chat_input("Ask a question about RTT...")
+# Input
+prompt = st.chat_input("Ask about RTT guidance...")
 
 if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    with st.spinner("Retrieving relevant guidance..."):
-        evidence = retrieve(index, chunks, prompt, k=k)
+    embedder = load_embedder()
+    retrieved = retrieve_chunks(prompt, index=index, chunks=chunks, embedder=embedder, k=k)
 
-    best_score = evidence[0][1] if evidence else 0.0
-
-    with st.expander("Retrieved guidance (top matches)", expanded=False):
-        st.write(f"Best similarity: **{best_score:.3f}** (threshold: {gate:.3f})")
-        for i, (ch, score) in enumerate(evidence, start=1):
-            st.markdown(f"**S{i} — score {score:.3f}** — {ch.citation}")
-            if ch.url:
-                st.markdown(f"- Source URL: {ch.url}")
-            st.markdown(ch.text[:2000] + ("…" if len(ch.text) > 2000 else ""))
-            st.divider()
-
-    if best_score < gate:
-        answer = (
-            "I can’t find strong enough evidence for that in the guidance.\n\n"
-            "Try rephrasing (e.g. include whether it’s an RTT pathway, DNA, active monitoring, treatment start, etc.), "
-            "or check the retrieved evidence section to see what *is* covered."
+    # Optional gate: if top score is low, you can warn the user
+    if retrieved and retrieved[0][1] < gate:
+        notice = (
+            f"I found some potentially relevant text, but similarity is low (top score {retrieved[0][1]:.2f}). "
+            "I may be missing the specific rule you're asking about."
         )
-        with st.chat_message("assistant"):
-            st.markdown(answer)
-        st.session_state.messages.append({"role": "assistant", "content": answer})
     else:
-        api_key_present = bool(os.getenv("OPENAI_API_KEY", "")) or bool(
-            (st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else "")
+        notice = ""
+
+    with st.chat_message("assistant"):
+        if notice:
+            st.info(notice)
+
+        answer, sources_used = answer_from_context(
+            user_question=prompt,
+            retrieved=retrieved,
+            use_llm=use_llm,
+            llm_model=llm_model,
         )
+        st.markdown(answer)
 
-        if use_llm and api_key_present:
-            with st.spinner("Generating answer..."):
-                try:
-                    answer = call_llm_answer(prompt, evidence, llm_model)
-                except Exception as e:
-                    answer = (
-                        f"LLM failed ({e}).\n\n"
-                        "Showing top evidence only. You can still use the retrieved passages above."
-                    )
+        with st.expander("Sources used"):
+            if not retrieved:
+                st.write("No sources retrieved.")
+            else:
+                for i, (ch, score) in enumerate(retrieved, start=1):
+                    st.markdown(f"**[S{i}] {ch.citation}**  \nSimilarity: `{score:.3f}`")
+                    st.write(ch.text)
+                    if ch.url:
+                        st.markdown(f"Link: {ch.url}")
 
-            verification = None
-            if verifier and "LLM failed" not in answer:
-                with st.spinner("Verifying answer..."):
-                    try:
-                        verification = call_llm_verify(answer, evidence, llm_model)
-                    except Exception as e:
-                        verification = {"error": str(e)}
-
-            with st.chat_message("assistant"):
-                st.markdown(answer)
-                if verification:
-                    with st.expander("Verification report", expanded=False):
-                        st.json(verification)
-
-            st.session_state.messages.append({"role": "assistant", "content": answer})
-        else:
-            top = evidence[:5]
-            lines = [
-                "I’m running in **evidence-only mode** (no LLM API key configured).",
-                "Here are the most relevant passages I found — these should contain the answer, with citations:",
-                "",
-            ]
-            for i, (ch, _score) in enumerate(top, start=1):
-                snippet = ch.text.strip().replace("\n", " ")
-                snippet = snippet[:400] + ("…" if len(snippet) > 400 else "")
-                lines.append(f"- **[S{i}] {ch.citation}** — {snippet}")
-
-            lines.append("")
-            lines.append("If you add an API key in Streamlit secrets, I can generate a full natural-language answer grounded in these sources.")
-            answer = "\n".join(lines)
-
-            with st.chat_message("assistant"):
-                st.markdown(answer)
-
-            st.session_state.messages.append({"role": "assistant", "content": answer})
+    st.session_state.messages.append({"role": "assistant", "content": answer})
