@@ -1,8 +1,11 @@
 """RTT assistant: ask questions about NHS England RTT waiting-times data (text-to-SQL) or the RTT rules (RAG).
 
 Run locally:  streamlit run app.py
-Secrets (Streamlit secrets or environment): OPENAI_API_KEY, optionally RTT_LLM_MODEL,
-MAX_QUESTIONS_PER_SESSION (default 15) and MAX_LLM_CALLS_PER_DAY (default 300).
+Settings (Streamlit secrets or environment):
+    LLM_PROVIDER   groq (default, free tier) | ollama (local) | huggingface | openai
+    GROQ_API_KEY / HF_TOKEN / OPENAI_API_KEY   the key for the chosen provider
+    LLM_MODEL      optional; each provider has a default open-weight model (see rtt_assistant/llm.py)
+    MAX_QUESTIONS_PER_SESSION (default 15), MAX_LLM_CALLS_PER_DAY (default 80)
 """
 
 from __future__ import annotations
@@ -16,7 +19,7 @@ import pandas as pd
 import streamlit as st
 
 from rtt_assistant import rag
-from rtt_assistant.llm import LLMError, OpenAIChat
+from rtt_assistant.llm import LLMError, OpenAICompatibleChat
 from rtt_assistant.pipeline import answer_question
 from rtt_assistant.sql.generate import database_facts
 from rtt_assistant.sql.run import connect_readonly
@@ -36,7 +39,7 @@ def secret(name: str, default: str = "") -> str:
 
 
 MAX_PER_SESSION = int(secret("MAX_QUESTIONS_PER_SESSION", "15"))
-MAX_PER_DAY = int(secret("MAX_LLM_CALLS_PER_DAY", "300"))
+MAX_PER_DAY = int(secret("MAX_LLM_CALLS_PER_DAY", "80"))  # keeps a free-tier key within its daily token cap
 EXAMPLES = [
     "How much has national RTT performance improved over the last two months?",
     "Which ten trusts have the most patients waiting over 52 weeks in the latest month?",
@@ -48,8 +51,9 @@ EXAMPLES = [
 
 # ---------------------------------------------------------------- shared resources
 @st.cache_resource
-def llm() -> OpenAIChat:
-    return OpenAIChat(api_key=secret("OPENAI_API_KEY"), model=secret("RTT_LLM_MODEL") or None)
+def llm() -> OpenAICompatibleChat:
+    names = ["LLM_PROVIDER", "LLM_MODEL", "LLM_BASE_URL", "GROQ_API_KEY", "HF_TOKEN", "OPENAI_API_KEY"]
+    return OpenAICompatibleChat(settings={n: v for n in names if (v := secret(n))})
 
 
 @st.cache_resource
@@ -94,8 +98,8 @@ st.caption("Ask about NHS England's Referral to Treatment waiting-times data, or
            "against the query results and sources before relying on them.")
 
 if not llm().available:
-    st.warning("No OpenAI API key is configured, so questions can't be answered. Add OPENAI_API_KEY to the "
-               "Streamlit secrets.")
+    st.warning(f"No API key is configured for {llm().provider.name}, so questions can't be answered. "
+               f"Add {llm().provider.key_env} to the Streamlit secrets.")
 
 tab_data, tab_rules, tab_about = st.tabs(["Ask the data", "Ask the rules", "How it works"])
 

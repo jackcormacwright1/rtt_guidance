@@ -2,7 +2,7 @@
 
 Reports hit@k: the share of questions where at least one of the top k passages comes from a page
 that answers the question. With --answers, also generates an answer for each question (needs
-OPENAI_API_KEY) and saves them next to the expected gist for review.
+a model; see rtt_assistant/llm.py) and saves them next to the expected gist for review.
 
 Usage:  python scripts/eval_rules.py [--k 4] [--answers] [--no-govuk]
 """
@@ -29,7 +29,7 @@ SOURCES = {"guidance": rag.PDFS[0].name, "faqs": rag.PDFS[1].name}
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--k", type=int, default=4)
-    ap.add_argument("--answers", action="store_true", help="also generate answers (uses the OpenAI API)")
+    ap.add_argument("--answers", action="store_true", help="also generate answers (uses the configured model)")
     ap.add_argument("--no-govuk", action="store_true", help="don't fetch the GOV.UK rules suite")
     args = ap.parse_args()
 
@@ -37,8 +37,8 @@ def main() -> None:
     index = rag.Index(rag.build_chunks(include_govuk=not args.no_govuk), rag.SentenceTransformerEmbedder())
     llm = None
     if args.answers:
-        from rtt_assistant.llm import OpenAIChat
-        llm = OpenAIChat()
+        from rtt_assistant.llm import OpenAICompatibleChat
+        llm = OpenAICompatibleChat()
 
     rows = []
     for q in questions:
