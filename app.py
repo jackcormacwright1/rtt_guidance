@@ -1,607 +1,200 @@
+"""RTT assistant: ask questions about NHS England RTT waiting-times data (text-to-SQL) or the RTT rules (RAG).
+
+Run locally:  streamlit run app.py
+Secrets (Streamlit secrets or environment): OPENAI_API_KEY, optionally RTT_LLM_MODEL,
+MAX_QUESTIONS_PER_SESSION (default 15) and MAX_LLM_CALLS_PER_DAY (default 300).
+"""
+
+from __future__ import annotations
+
 import os
-import re
-import json
-import time
-import hashlib
-from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
+from datetime import date
+from pathlib import Path
 
-import requests
+import altair as alt
+import pandas as pd
 import streamlit as st
-from bs4 import BeautifulSoup
-from pypdf import PdfReader
 
-# Word documents (.docx)
-try:
-    from docx import Document  # python-docx
-except Exception:
-    Document = None
+from rtt_assistant import rag
+from rtt_assistant.llm import LLMError, OpenAIChat
+from rtt_assistant.pipeline import answer_question
+from rtt_assistant.sql.generate import database_facts
+from rtt_assistant.sql.run import connect_readonly
 
-import numpy as np
-import faiss
-from sentence_transformers import SentenceTransformer
+st.set_page_config(page_title="RTT assistant", page_icon="🩺", layout="wide")
+
+ROOT = Path(__file__).resolve().parent
+DB_PATH = ROOT / "data" / "rtt.duckdb"
+BLUE = "#2a78d6"
 
 
-# =========================
-# CONFIG / SECRETS
-# =========================
-st.set_page_config(page_title="RTT Chatbot", layout="wide")
+def secret(name: str, default: str = "") -> str:
+    try:
+        return str(st.secrets.get(name, os.environ.get(name, default)))
+    except Exception:  # noqa: BLE001 - no secrets file
+        return os.environ.get(name, default)
 
-try:
-    key = st.secrets.get("OPENAI_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "")
-    if key:
-        os.environ["OPENAI_API_KEY"] = key
-except Exception:
-    pass
 
-GOVUK_URL = "https://www.gov.uk/government/publications/right-to-start-consultant-led-treatment-within-18-weeks/referral-to-treatment-consultant-led-waiting-times-rules-suite-october-2022"
-
-DEFAULT_PDF_PATHS = [
-    "data/Recording-and-reporting-RTT-waiting-times-guidance-v5.2-Feb25.pdf",
-    "data/Recording-and-reporting-RTT-waiting-times-guidance-Accompanying-FAQs-v1.4-Feb25.pdf",
+MAX_PER_SESSION = int(secret("MAX_QUESTIONS_PER_SESSION", "15"))
+MAX_PER_DAY = int(secret("MAX_LLM_CALLS_PER_DAY", "300"))
+EXAMPLES = [
+    "How much has national RTT performance improved over the last two months?",
+    "Which ten trusts have the most patients waiting over 52 weeks in the latest month?",
+    "How has the trauma and orthopaedics waiting list changed over the past year?",
+    "What share of Lewisham and Greenwich's waiting list is within 18 weeks, by specialty, in the latest month?",
+    "Is demand (new clock starts) for ENT rising or falling?",
 ]
 
-# Local access policy (Word document)
-DEFAULT_DOCX_PATHS = [
-    "data/South East London Access Policy.docx",
-    "data/South East London Access Policy.DOCX",
-]
-
-CACHE_DIR = ".cache_rtt_bot"
-INDEX_DIR = os.path.join(CACHE_DIR, "index")
-os.makedirs(INDEX_DIR, exist_ok=True)
-
-EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-DEFAULT_LLM_MODEL = "gpt-5.2"
-
-
-# =========================
-# DATA MODELS
-# =========================
-@dataclass
-class Chunk:
-    text: str
-    source: str
-    citation: str
-    url: Optional[str] = None
-    page: Optional[int] = None
-    heading: Optional[str] = None
-
-
-# =========================
-# UTILITIES
-# =========================
-def _clean_text(s: str) -> str:
-    s = s or ""
-    s = s.replace("\u00a0", " ")  # non-breaking spaces
-    s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
-
-
-def _hash_sources(url: str, pdf_paths: List[str], docx_paths: List[str]) -> str:
-    h = hashlib.sha256()
-    h.update(url.encode("utf-8"))
-    for p in (pdf_paths + docx_paths):
-        h.update(p.encode("utf-8"))
-        try:
-            stat = os.stat(p)
-            h.update(str(stat.st_mtime).encode("utf-8"))
-            h.update(str(stat.st_size).encode("utf-8"))
-        except FileNotFoundError:
-            h.update(b"missing")
-    return h.hexdigest()[:16]
-
-
-def _split_into_chunks(
-    text: str,
-    source: str,
-    base_citation: str,
-    url: Optional[str] = None,
-    heading: Optional[str] = None,
-    page: Optional[int] = None,
-    max_chars: int = 1800,
-    overlap_chars: int = 250,
-) -> List[Chunk]:
-    text = _clean_text(text)
-    if not text:
-        return []
-
-    chunks: List[Chunk] = []
-    start = 0
-    while start < len(text):
-        end = min(len(text), start + max_chars)
-        chunk_text = text[start:end].strip()
-
-        if chunk_text:
-            citation = base_citation
-            if heading:
-                citation = f"{citation} – {heading}"
-            if page is not None:
-                citation = f"{citation} (p{page})"
-
-            chunks.append(
-                Chunk(
-                    text=chunk_text,
-                    source=source,
-                    citation=citation,
-                    url=url,
-                    page=page,
-                    heading=heading,
-                )
-            )
-
-        if end == len(text):
-            break
-        start = max(0, end - overlap_chars)
-
-    return chunks
-
-
-# =========================
-# GOV.UK SCRAPE
-# =========================
-@st.cache_data(show_spinner=False)
-def fetch_govuk_article(url: str) -> Dict[str, str]:
-    """
-    Fetches GOV.UK Rules Suite and returns a dict of {heading: text}.
-    This is intentionally a light scrape (not perfect), but robust enough
-    for semantic retrieval.
-    """
-    try:
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-    except Exception:
-        return {"GOV.UK": ""}
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    content = soup.find("div", class_=re.compile(r"govuk-body"))
-    if not content:
-        content = soup
-
-    sections: Dict[str, List[str]] = {}
-    current_heading = "GOV.UK"
-    sections[current_heading] = []
-
-    for el in content.find_all(["h2", "h3", "h4", "p", "li"]):
-        tag = el.name.lower()
-        txt = _clean_text(el.get_text(" ", strip=True))
-        if not txt:
-            continue
-
-        if tag in ("h2", "h3", "h4"):
-            current_heading = txt
-            sections.setdefault(current_heading, [])
-        else:
-            sections.setdefault(current_heading, []).append(txt)
-
-    return {k: _clean_text("\n".join(v)) for k, v in sections.items()}
-
-
-# =========================
-# PDF READER
-# =========================
-@st.cache_data(show_spinner=False)
-def read_pdf_pages(pdf_path: str) -> List[str]:
-    reader = PdfReader(pdf_path)
-    pages: List[str] = []
-    for page in reader.pages:
-        try:
-            txt = page.extract_text() or ""
-        except Exception:
-            txt = ""
-        pages.append(_clean_text(txt))
-    return pages
-
-
-@st.cache_data(show_spinner=False)
-def read_docx_text(docx_path: str) -> str:
-    """Extract text from a .docx (paragraphs + tables).
-
-    Notes:
-    - Access policies are often heavy on tables, so we include them.
-    - We keep this deliberately simple and robust rather than trying to
-      perfectly preserve formatting.
-    """
-    if Document is None:
-        # python-docx isn't installed. Return empty so the app still runs.
-        return ""
-
-    try:
-        doc = Document(docx_path)
-    except Exception:
-        return ""
-
-    parts: List[str] = []
-
-    # Paragraphs
-    for p in getattr(doc, "paragraphs", []) or []:
-        t = _clean_text(getattr(p, "text", "") or "")
-        if t:
-            parts.append(t)
-
-    # Tables
-    for table in getattr(doc, "tables", []) or []:
-        for row in getattr(table, "rows", []) or []:
-            cells = []
-            for cell in getattr(row, "cells", []) or []:
-                cells.append(_clean_text(getattr(cell, "text", "") or ""))
-            line = " | ".join([c for c in cells if c])
-            line = _clean_text(line)
-            if line:
-                parts.append(line)
-
-    return _clean_text("\n".join(parts))
-
-
-# =========================
-# CHUNK BUILDER
-# =========================
-def build_chunks(url: str, pdf_paths: List[str], docx_paths: List[str]) -> List[Chunk]:
-    chunks: List[Chunk] = []
-
-    sections = fetch_govuk_article(url)
-    for heading, block in sections.items():
-        chunks.extend(
-            _split_into_chunks(
-                text=block,
-                source="GOVUK",
-                base_citation="GOV.UK Rules Suite (Oct 2022)",
-                url=url,
-                heading=heading,
-                page=None,
-            )
-        )
-
-    for pdf_path in pdf_paths:
-        if not os.path.exists(pdf_path):
-            continue
-
-        filename = os.path.basename(pdf_path)
-        pages = read_pdf_pages(pdf_path)
-
-        for page_num, page_text in enumerate(pages, start=1):
-            if not page_text:
-                continue
-            chunks.extend(
-                _split_into_chunks(
-                    text=page_text,
-                    source=filename,
-                    base_citation=filename,
-                    url=None,
-                    heading=None,
-                    page=page_num,
-                    max_chars=1800,
-                    overlap_chars=200,
-                )
-            )
-
-    # Access policy (Word document)
-    for docx_path in docx_paths:
-        if not os.path.exists(docx_path):
-            continue
-
-        filename = os.path.basename(docx_path)
-        txt = read_docx_text(docx_path)
-        if not txt:
-            continue
-
-        chunks.extend(
-            _split_into_chunks(
-                text=txt,
-                source=filename,
-                base_citation=filename,
-                url=None,
-                heading="Access policy",
-                page=None,
-                max_chars=1800,
-                overlap_chars=200,
-            )
-        )
-
-    return chunks
-
-
-# =========================
-# INDEX (EMBED + FAISS)
-# =========================
-@st.cache_resource(show_spinner=False)
-def load_embedder(model_name: str = EMBED_MODEL_NAME) -> SentenceTransformer:
-    return SentenceTransformer(model_name)
-
-
-def _index_paths(source_hash: str) -> Tuple[str, str]:
-    idx_path = os.path.join(INDEX_DIR, f"{source_hash}.faiss")
-    meta_path = os.path.join(INDEX_DIR, f"{source_hash}.meta.json")
-    return idx_path, meta_path
-
-
-def _load_chunks_meta(meta_path: str) -> List[Chunk]:
-    if meta_path.endswith(".json") and os.path.exists(meta_path):
-        with open(meta_path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        return [Chunk(**item) for item in raw]
-
-    pkl_path = meta_path.replace(".meta.json", ".meta.pkl")
-    if os.path.exists(pkl_path):
-        try:
-            import pickle
-
-            with open(pkl_path, "rb") as f:
-                chunks = pickle.load(f)
-
-            # migrate to JSON
-            try:
-                with open(meta_path, "w", encoding="utf-8") as f:
-                    json.dump([c.__dict__ for c in chunks], f, ensure_ascii=False, indent=2)
-            except Exception:
-                pass
-
-            return chunks
-        except Exception:
-            return []
-
-    return []
-
-
-def _save_chunks_meta(meta_path: str, chunks: List[Chunk]) -> None:
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump([c.__dict__ for c in chunks], f, ensure_ascii=False, indent=2)
-
-
-def _build_faiss_index(embeddings: np.ndarray) -> faiss.Index:
-    dim = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dim)
-    faiss.normalize_L2(embeddings)
-    index.add(embeddings.astype(np.float32))
-    return index
-
-
-def _embed_texts(embedder: SentenceTransformer, texts: List[str], batch_size: int = 64) -> np.ndarray:
-    # SentenceTransformer returns numpy arrays; ensure float32
-    emb = embedder.encode(texts, batch_size=batch_size, show_progress_bar=False, normalize_embeddings=True)
-    emb = np.array(emb, dtype=np.float32)
-    return emb
-
-
-def build_or_load_index(url: str, pdf_paths: List[str], docx_paths: List[str]) -> Tuple[faiss.Index, List[Chunk], str]:
-    source_hash = _hash_sources(url, pdf_paths, docx_paths)
-    idx_path, meta_path = _index_paths(source_hash)
-
-    embedder = load_embedder()
-
-    if os.path.exists(idx_path) and os.path.exists(meta_path):
-        try:
-            index = faiss.read_index(idx_path)
-            chunks = _load_chunks_meta(meta_path)
-            if len(chunks) > 0:
-                return index, chunks, source_hash
-        except Exception:
-            pass  # fall through to rebuild
-
-    # Build from scratch
-    chunks = build_chunks(url, pdf_paths, docx_paths)
-    texts = [c.text for c in chunks]
-    embeddings = _embed_texts(embedder, texts)
-    index = _build_faiss_index(embeddings)
-
-    faiss.write_index(index, idx_path)
-    _save_chunks_meta(meta_path, chunks)
-
-    return index, chunks, source_hash
-
-
-def retrieve_chunks(
-    query: str,
-    index: faiss.Index,
-    chunks: List[Chunk],
-    embedder: SentenceTransformer,
-    k: int = 4,
-) -> List[Tuple[Chunk, float]]:
-    q_emb = _embed_texts(embedder, [query])
-    faiss.normalize_L2(q_emb)
-    scores, idxs = index.search(q_emb, k)
-    results: List[Tuple[Chunk, float]] = []
-    for i, score in zip(idxs[0], scores[0]):
-        if i < 0 or i >= len(chunks):
-            continue
-        results.append((chunks[i], float(score)))
-    return results
-
-
-# =========================
-# LLM / RESPONSE GENERATION
-# =========================
-def format_context_for_prompt(retrieved: List[Tuple[Chunk, float]]) -> str:
-    parts = []
-    for n, (ch, score) in enumerate(retrieved, start=1):
-        header = f"[S{n}] {ch.citation}"
-        parts.append(header)
-        parts.append(ch.text)
-        parts.append("")  # blank line
-    return "\n".join(parts).strip()
-
-
-def answer_from_context(
-    user_question: str,
-    retrieved: List[Tuple[Chunk, float]],
-    use_llm: bool = True,
-    llm_model: str = DEFAULT_LLM_MODEL,
-) -> Tuple[str, List[str]]:
-    
-    sources_used = [ch.citation for ch, _ in retrieved]
-
-    context = format_context_for_prompt(retrieved)
-    if not use_llm:
-        # Naive extractive fallback: return the top chunk(s)
-        if not retrieved:
-            return "I couldn't find anything relevant in the indexed guidance.", []
-        top = retrieved[0][0]
-        return f"Best match from sources:\n\n{top.text}\n\nSources:\n- " + "\n- ".join(sources_used), sources_used
-
-    api_key = os.environ.get("OPENAI_API_KEY", "")
-    if not api_key:
-        return (
-            "OpenAI API key not set. Add OPENAI_API_KEY to Streamlit secrets or environment, "
-            "or toggle 'Use LLM' off for extractive mode.",
-            sources_used,
-        )
-
-    system = (
-        "You are an assistant helping an NHS analyst interpret RTT (Referral to Treatment) guidance. "
-        "Answer using ONLY the provided sources context. "
-        "If the sources do not contain the answer, say so clearly. "
-        "Use UK English. Be precise and practical."
-    )
-
-    user = (
-        f"Question:\n{user_question}\n\n"
-        f"Sources context:\n{context}\n\n"
-        "Answer in a structured way. Include short bullet points where helpful. "
-        "Cite sources by referencing [S1], [S2], etc inline."
-    )
-
-    try:
-        resp = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "model": llm_model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "temperature": 0.2,
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        answer = data["choices"][0]["message"]["content"]
-        return answer, sources_used
-    except Exception as e:
-        return f"LLM call failed: {e}", sources_used
-
-
-# =========================
-# STREAMLIT UI
-# =========================
-st.title("RTT Guidance Chatbot")
-st.caption("GOV.UK Rules Suite + NHSE RTT Guidance PDFs + Access Policy (.docx)")
-
-NHSE_LINKS = {
-    "Recording and reporting RTT waiting times guidance v5.2 (Feb 2025)": "https://www.england.nhs.uk/statistics/wp-content/uploads/sites/2/2025/02/Recording-and-reporting-RTT-waiting-times-guidance-v5.2-Feb25.pdf",
-    "Accompanying FAQs v1.4 (Feb 2025)": "https://www.england.nhs.uk/statistics/wp-content/uploads/sites/2/2025/02/Recording-and-reporting-RTT-waiting-times-guidance-Accompanying-FAQs-v1.4-Feb25.pdf",
-}
-
-pdf_paths = []
-for p in DEFAULT_PDF_PATHS:
-    pdf_paths.append(p)
-
-docx_paths = []
-for p in DEFAULT_DOCX_PATHS:
-    if os.path.exists(p):
-        docx_paths.append(p)
-
-with st.sidebar:
-    st.header("Sources")
-
-    st.markdown("**GOV.UK**")
-    st.markdown(f"[Referral to Treatment Rules Suite]({GOVUK_URL})")
-
-    st.markdown("**NHSE Guidance Docs**")
-    for filename, url in NHSE_LINKS.items():
-        st.markdown(f"[{filename}]({url})")
-
-    st.markdown("**Access Policy (.docx)**")
-    
-    if not docx_paths:
-        st.warning("No access policy .docx found in ./data.")
+
+# ---------------------------------------------------------------- shared resources
+@st.cache_resource
+def llm() -> OpenAIChat:
+    return OpenAIChat(api_key=secret("OPENAI_API_KEY"), model=secret("RTT_LLM_MODEL") or None)
+
+
+@st.cache_resource
+def database():
+    con = connect_readonly(DB_PATH)
+    return con, database_facts(con)
+
+
+@st.cache_resource
+def daily_usage() -> dict:
+    return {}
+
+
+def allow_llm_calls(n: int) -> str | None:
+    """Simple spending guard for a public deployment: per-session and per-day limits."""
+    used_session = st.session_state.get("questions_asked", 0)
+    if used_session >= MAX_PER_SESSION:
+        return f"This session has used its {MAX_PER_SESSION} questions. Refresh the page later to ask more."
+    usage = daily_usage()
+    today = str(date.today())
+    if usage.get(today, 0) + n > MAX_PER_DAY:
+        return "The demo has reached its daily question limit. Please try again tomorrow."
+    return None
+
+
+def record_llm_calls(n: int) -> None:
+    st.session_state["questions_asked"] = st.session_state.get("questions_asked", 0) + 1
+    usage = daily_usage()
+    today = str(date.today())
+    usage[today] = usage.get(today, 0) + n
+
+
+@st.cache_resource(show_spinner="Indexing the RTT guidance (first run only)…")
+def rules_index() -> rag.Index:
+    return rag.Index(rag.build_chunks(), rag.SentenceTransformerEmbedder())
+
+
+# ---------------------------------------------------------------- page
+st.title("RTT assistant")
+st.caption("Ask about NHS England's Referral to Treatment waiting-times data, or about the RTT rules. "
+           "Answers are generated by a language model from the data and documents shown, so check them "
+           "against the query results and sources before relying on them.")
+
+if not llm().available:
+    st.warning("No OpenAI API key is configured, so questions can't be answered. Add OPENAI_API_KEY to the "
+               "Streamlit secrets.")
+
+tab_data, tab_rules, tab_about = st.tabs(["Ask the data", "Ask the rules", "How it works"])
+
+with tab_data:
+    if not DB_PATH.exists():
+        st.error("The RTT database hasn't been built yet. Run `python scripts/build_db.py` (see the README).")
     else:
-        for p in docx_paths:
-            filename = os.path.basename(p)
-    
-            with open(p, "rb") as f:
-                file_bytes = f.read()
-    
-            st.download_button(
-                label=f"{filename}",
-                data=file_bytes,
-                file_name=filename,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            )
-
-    k = 4
-    gate = 0.38
-    use_llm = True
-    llm_model = DEFAULT_LLM_MODEL
-    verifier = True
-
-
-# Build/load index
-with st.spinner("Building index..."):
-    index, chunks, source_hash = build_or_load_index(GOVUK_URL, pdf_paths, docx_paths)
-
-st.success("Ready")
-
-# Chat state
-if "messages" not in st.session_state:
-    st.session_state.messages = [
-        {
-            "role": "assistant",
-            "content": (
-                "Ask me a question about RTT rules/guidance. I’ll answer using the provided sources.\n\n"
-                "Please be specific (e.g. 'Should trauma pathways be included in RTT?')."
-            ),
-        }
-    ]
-
-# Display history
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-
-# Input
-prompt = st.chat_input("Ask about RTT guidance...")
-
-if prompt:
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    embedder = load_embedder()
-    retrieved = retrieve_chunks(prompt, index=index, chunks=chunks, embedder=embedder, k=k)
-
-    # if top score is low warn the user
-    if retrieved and retrieved[0][1] < gate:
-        notice = (
-            f"I found some potentially relevant text, but similarity is low (top score {retrieved[0][1]:.2f}). "
-            "I may be missing the specific rule you're asking about."
-        )
-    else:
-        notice = ""
-
-    with st.chat_message("assistant"):
-        if notice:
-            st.info(notice)
-
-        answer, sources_used = answer_from_context(
-            user_question=prompt,
-            retrieved=retrieved,
-            use_llm=use_llm,
-            llm_model=llm_model,
-        )
-        st.markdown(answer)
-
-        with st.expander("Sources used"):
-            if not retrieved:
-                st.write("No sources retrieved.")
+        con, facts = database()
+        months = con.execute("SELECT MIN(period), MAX(period) FROM waiting_list").fetchone()
+        st.markdown(f"Provider-level RTT data from NHS England, **{months[0]:%B %Y} to {months[1]:%B %Y}**: the "
+                    "waiting list, completed pathways and new clock starts, by provider and specialty.")
+        cols = st.columns(len(EXAMPLES))
+        for c, ex in zip(cols, EXAMPLES):
+            if c.button(ex, width="stretch"):
+                st.session_state["data_q"] = ex
+        question = st.text_input("Your question", key="data_q",
+                                 placeholder="e.g. How many patients were waiting over 52 weeks in the latest month?")
+        if st.button("Ask", type="primary", disabled=not question or not llm().available):
+            if (block := allow_llm_calls(2)):
+                st.warning(block)
             else:
-                for i, (ch, score) in enumerate(retrieved, start=1):
-                    st.markdown(f"**[S{i}] {ch.citation}**  \nSimilarity: `{score:.3f}`")
-                    st.write(ch.text)
-                    if ch.url:
-                        st.markdown(f"Link: {ch.url}")
+                with st.spinner("Writing and running the query…"):
+                    ans = answer_question(question, llm(), con, facts)
+                record_llm_calls(ans.llm_calls)
+                st.session_state["last_data_answer"] = ans
 
-    st.session_state.messages.append({"role": "assistant", "content": answer})
+        ans = st.session_state.get("last_data_answer")
+        if ans is not None:
+            st.subheader("Answer")
+            if ans.error:
+                st.error(ans.error)
+            elif ans.cannot_answer:
+                st.info(ans.answer)
+            else:
+                st.markdown(ans.answer)
+                if ans.ungrounded:
+                    st.warning("These numbers in the answer don't appear in the query result, so check them "
+                               f"against the table: {', '.join(ans.ungrounded)}")
+            if ans.result is not None and len(ans.result):
+                df = ans.result
+                numeric = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+                if "period" in df.columns and df["period"].nunique() > 1 and numeric:
+                    measure = st.selectbox("Chart", numeric, key="chart_measure") if len(numeric) > 1 else numeric[0]
+                    plot = df.assign(period=pd.to_datetime(df["period"]))
+                    group = [c for c in df.columns if c not in numeric and c != "period"]
+                    color = alt.Color(f"{group[0]}:N", legend=alt.Legend(orient="bottom")) if group else alt.value(BLUE)
+                    chart = alt.Chart(plot).mark_line(point=True, strokeWidth=2).encode(
+                        x=alt.X("period:T", title="Month"), y=alt.Y(f"{measure}:Q", scale=alt.Scale(zero=False)),
+                        color=color, tooltip=list(plot.columns))
+                    st.altair_chart(chart.properties(height=300), width="stretch")
+                st.dataframe(df, hide_index=True, width="stretch")
+            with st.expander("How this answer was produced"):
+                for n, a in enumerate(ans.attempts, start=1):
+                    st.markdown(f"**Query {n}**" + (" (failed)" if a["error"] else ""))
+                    st.code(a["sql"], language="sql")
+                    if a["error"]:
+                        st.caption(f"Error sent back to the model: {a['error']}")
+                if ans.assumptions:
+                    st.markdown(f"**Assumptions:** {ans.assumptions}")
+                st.caption(f"Model: {llm().name}. Model calls: {ans.llm_calls}.")
+
+with tab_rules:
+    st.markdown("Answers come only from the GOV.UK RTT rules suite, NHS England's recording and reporting "
+                "guidance and FAQs, and the access policy, with the passages used shown under each answer.")
+    if "rules_messages" not in st.session_state:
+        st.session_state["rules_messages"] = []
+    for msg in st.session_state["rules_messages"]:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+    prompt = st.chat_input("Ask about the RTT rules, e.g. 'Does a cancelled appointment stop the clock?'")
+    if prompt:
+        st.session_state["rules_messages"].append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        with st.chat_message("assistant"):
+            if (block := allow_llm_calls(1)):
+                st.warning(block)
+            else:
+                retrieved = rules_index().search(prompt, k=4)
+                if retrieved and retrieved[0][1] < 0.38:
+                    st.info(f"The closest passages are only loosely related (similarity {retrieved[0][1]:.2f}), "
+                            "so the guidance may not cover this directly.")
+                try:
+                    answer = llm().complete(rag.SYSTEM, rag.build_prompt(prompt, retrieved))
+                except LLMError as e:
+                    answer = f"The model call failed: {e}"
+                record_llm_calls(1)
+                st.markdown(answer)
+                with st.expander("Passages used"):
+                    for n, (ch, score) in enumerate(retrieved, start=1):
+                        st.markdown(f"**[S{n}] {ch.citation}** (similarity {score:.2f})")
+                        st.write(ch.text)
+                st.session_state["rules_messages"].append({"role": "assistant", "content": answer})
+    with st.sidebar:
+        st.header("Guidance sources")
+        st.markdown(f"[GOV.UK RTT rules suite]({rag.GOVUK_URL})")
+        for title, url in rag.NHSE_LINKS.items():
+            st.markdown(f"[{title}]({url})")
+
+with tab_about:
+    readme = ROOT / "docs" / "HOW_IT_WORKS.md"
+    st.markdown(readme.read_text(encoding="utf-8") if readme.exists() else "See the README in the repository.")

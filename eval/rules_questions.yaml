@@ -1,0 +1,78 @@
+# Questions about the RTT rules, each with the pages of the NHS England guidance that answer it.
+# 'guidance' = Recording and reporting RTT waiting times guidance v5.2 (Feb 2025)
+# 'faqs'     = Accompanying FAQs v1.4 (Feb 2025)
+# Retrieval is scored as hit@k: does any of the top k passages come from one of these pages?
+# 'answer' is the expected gist, for reviewing generated answers.
+
+- id: r01
+  question: If the hospital cancels a patient's operation because no theatre was available, does the RTT clock stop?
+  expected: [{source: guidance, pages: [19, 20, 26]}]
+  answer: No. The clock keeps ticking until the patient is admitted and treated.
+- id: r02
+  question: Surgery was cancelled on the day because the patient had a chest infection. Does the clock stop?
+  expected: [{source: guidance, pages: [20, 26]}]
+  answer: No. The clock continues unless a clinical decision is made that the patient is unsuitable for treatment.
+- id: r03
+  question: What happens to the RTT clock if a patient does not attend their first outpatient appointment?
+  expected: [{source: guidance, pages: [22, 23]}, {source: faqs, pages: [22]}]
+  answer: A DNA of the first appointment nullifies the clock, provided the appointment was clearly communicated.
+- id: r04
+  question: If a patient cancels or postpones their appointment, does that stop the clock?
+  expected: [{source: guidance, pages: [26]}]
+  answer: No. Patient-initiated cancellations don't stop the clock unless a clinical decision is made to discharge or start active monitoring.
+- id: r05
+  question: Does a short period of thinking time about treatment options stop the RTT clock?
+  expected: [{source: guidance, pages: [25]}, {source: faqs, pages: [8, 9]}]
+  answer: No. For short thinking time the clock continues to tick.
+- id: r06
+  question: How long can thinking time go on before the provider should contact the patient?
+  expected: [{source: faqs, pages: [8, 9]}]
+  answer: The provider should contact the patient once more than 14 days have passed.
+- id: r07
+  question: When does the RTT clock start for a referral made through the NHS e-Referral Service?
+  expected: [{source: guidance, pages: [11, 12]}]
+  answer: When the UBRN is converted, or appears on the provider's Appointment Slot Issue work list if no slot is available.
+- id: r08
+  question: When does the clock start for a private patient who transfers to NHS care?
+  expected: [{source: faqs, pages: [4]}]
+  answer: When clinical responsibility transfers to the NHS, i.e. when the NHS trust accepts the referral.
+- id: r09
+  question: Are patients on planned waiting lists included in RTT measurement?
+  expected: [{source: guidance, pages: [28]}]
+  answer: No. Planned patients are outside the scope of RTT measurement.
+- id: r10
+  question: Is IVF treatment covered by RTT waiting times?
+  expected: [{source: faqs, pages: [15]}]
+  answer: Consultant-led NHS IVF and fertility treatment is included; privately funded IVF is not.
+- id: r11
+  question: Are fracture clinic appointments covered by RTT?
+  expected: [{source: faqs, pages: [5]}]
+  answer: No. Fracture clinic activity is generally planned care after A&E and out of scope.
+- id: r12
+  question: When a patient is transferred to a tertiary centre, which provider reports their RTT wait?
+  expected: [{source: guidance, pages: [51]}]
+  answer: The provider with overall clinical responsibility; reporting passes with clinical responsibility.
+- id: r13
+  question: What should a provider do if it cannot identify a patient's clock start date?
+  expected: [{source: guidance, pages: [45]}]
+  answer: Report the patient in the 'unknown clock start' column, as a last resort after validation.
+- id: r14
+  question: Which events stop an RTT clock?
+  expected: [{source: guidance, pages: [8, 9]}]
+  answer: First definitive treatment, or a clinical decision that stops the clock, or the patient declining treatment.
+- id: r15
+  question: If a patient misses a telephone or video appointment, does it count as a DNA?
+  expected: [{source: faqs, pages: [22]}]
+  answer: Yes. It is treated like any other DNA.
+- id: r16
+  question: What is active monitoring, and when does a new clock start after it?
+  expected: [{source: guidance, pages: [24, 25, 56]}]
+  answer: A clinically appropriate period of monitoring without intervention that stops the clock; a new clock starts on the decision to treat.
+- id: r17
+  question: What is a straight to test pathway?
+  expected: [{source: guidance, pages: [61]}, {source: faqs, pages: [14, 15]}]
+  answer: The clinician refers the patient directly for a diagnostic test, bypassing the first outpatient appointment.
+- id: r18
+  question: Does a referral to an orthodontist start an RTT clock?
+  expected: [{source: faqs, pages: [17]}]
+  answer: A referral to an orthodontic consultant does; referrals to non-consultant orthodontic services don't.
