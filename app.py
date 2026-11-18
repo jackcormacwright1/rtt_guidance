@@ -1,4 +1,4 @@
-"""RTT assistant: ask questions about NHS England RTT waiting-times data (text-to-SQL) or the RTT rules (RAG).
+"""RTT assistant: ask questions about London RTT waiting-times data (text-to-SQL) or the RTT rules (RAG).
 
 Run locally:  streamlit run app.py
 Settings (Streamlit secrets or environment):
@@ -19,6 +19,7 @@ import pandas as pd
 import streamlit as st
 
 from rtt_assistant import rag
+from rtt_assistant.data.ingest import build_database
 from rtt_assistant.llm import LLMError, OpenAICompatibleChat
 from rtt_assistant.pipeline import answer_question
 from rtt_assistant.sql.generate import database_facts
@@ -28,6 +29,7 @@ st.set_page_config(page_title="RTT assistant", page_icon="🩺", layout="wide")
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "data" / "rtt.duckdb"
+SOURCE = ROOT / "data" / "source" / "london_rtt_2018-04_to_2023-04.parquet"
 BLUE = "#2a78d6"
 
 
@@ -41,11 +43,11 @@ def secret(name: str, default: str = "") -> str:
 MAX_PER_SESSION = int(secret("MAX_QUESTIONS_PER_SESSION", "15"))
 MAX_PER_DAY = int(secret("MAX_LLM_CALLS_PER_DAY", "80"))  # keeps a free-tier key within its daily token cap
 EXAMPLES = [
-    "How much has national RTT performance improved over the last two months?",
-    "Which ten trusts have the most patients waiting over 52 weeks in the latest month?",
-    "How has the trauma and orthopaedics waiting list changed over the past year?",
-    "What share of Lewisham and Greenwich's waiting list is within 18 weeks, by specialty, in the latest month?",
-    "Is demand (new clock starts) for ENT rising or falling?",
+    "How has 18-week performance across London changed over the last two months?",
+    "Which North West London trust had the most patients waiting over 52 weeks in April 2023?",
+    "How did the number waiting over 52 weeks at Imperial change through 2020 and 2021?",
+    "How many North West London residents were waiting at hospitals elsewhere in London in April 2023?",
+    "Is demand for trauma and orthopaedics at Hillingdon back to pre-COVID levels?",
 ]
 
 
@@ -56,8 +58,10 @@ def llm() -> OpenAICompatibleChat:
     return OpenAICompatibleChat(settings={n: v for n in names if (v := secret(n))})
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner="Building the RTT database (first run only)…")
 def database():
+    if not DB_PATH.exists():
+        build_database(SOURCE, DB_PATH)
     con = connect_readonly(DB_PATH)
     return con, database_facts(con)
 
@@ -104,17 +108,19 @@ if not llm().available:
 tab_data, tab_rules, tab_about = st.tabs(["Ask the data", "Ask the rules", "How it works"])
 
 with tab_data:
-    if not DB_PATH.exists():
-        st.error("The RTT database hasn't been built yet. Run `python scripts/build_db.py` (see the README).")
+    if not DB_PATH.exists() and not SOURCE.exists():
+        st.error("The RTT data isn't in the repository. Run `python scripts/build_db.py` (see the README).")
     else:
         con, facts = database()
         months = con.execute("SELECT MIN(period), MAX(period) FROM waiting_list").fetchone()
-        st.markdown(f"Provider-level RTT data from NHS England, **{months[0]:%B %Y} to {months[1]:%B %Y}**: the "
-                    "waiting list, completed pathways and new clock starts, by provider and specialty.")
-        cols = st.columns(len(EXAMPLES))
-        for c, ex in zip(cols, EXAMPLES):
-            if c.button(ex, width="stretch"):
-                st.session_state["data_q"] = ex
+        st.markdown(f"NHS England's RTT statistics for London providers, **{months[0]:%B %Y} to {months[1]:%B %Y}**: "
+                    "the waiting list, completed pathways and new clock starts, by provider and specialty. The four "
+                    "North West London trusts and Royal Free London appear individually; other London trusts are "
+                    "grouped by area. Waits are recorded in bands up to 'over 52 weeks'.")
+        pick = st.pills("Try an example", EXAMPLES, selection_mode="single", key="example_pick")
+        if pick and pick != st.session_state.get("last_pick"):
+            st.session_state["data_q"] = pick  # fill the box below (it is created after this line)
+        st.session_state["last_pick"] = pick
         question = st.text_input("Your question", key="data_q",
                                  placeholder="e.g. How many patients were waiting over 52 weeks in the latest month?")
         if st.button("Ask", type="primary", disabled=not question or not llm().available):
@@ -135,6 +141,8 @@ with tab_data:
                 st.info(ans.answer)
             else:
                 st.markdown(ans.answer)
+                if ans.caveat:
+                    st.warning(ans.caveat)
                 if ans.ungrounded:
                     st.warning("These numbers in the answer don't appear in the query result, so check them "
                                f"against the table: {', '.join(ans.ungrounded)}")

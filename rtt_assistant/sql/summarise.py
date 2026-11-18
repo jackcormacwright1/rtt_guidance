@@ -4,20 +4,53 @@ from __future__ import annotations
 
 import itertools
 import re
+from datetime import date
 
 import numpy as np
 import pandas as pd
 
 SYSTEM = (
-    "You explain NHS England waiting-time statistics to a busy NHS manager. You use only the numbers in the "
+    "You explain NHS waiting-time statistics to a busy NHS manager. You use only the numbers in the "
     "query result you are given, and you write in UK English."
 )
 
-DATA_NOTE = ("Figures are sums of the monthly returns submitted by providers. They can differ slightly from NHS "
-             "England's published national totals, which add estimates for trusts that didn't submit.")
+DATA_NOTE = ("NHS England's published RTT statistics for London providers, April 2018 to April 2023, as submitted "
+             "by trusts. Trusts outside North West London, apart from Royal Free London, are grouped by area.")
 
 
-def build_prompt(question: str, sql: str, result: pd.DataFrame, assumptions: str = "") -> str:
+def coverage_warning(result: pd.DataFrame | None, sql: str | None, gaps: dict[str, set[date]]) -> str:
+    """A caveat when the result covers months in which a provider is missing from the data.
+
+    ``gaps`` maps provider name -> months with no data. The caveat is skipped when the query is limited to
+    other providers (it filters on provider_name or provider_area without mentioning the missing one).
+    """
+    if result is None or not len(result) or not gaps or not sql:
+        return ""
+    months: set[date] = set()
+    if "period" in result.columns:
+        months |= {d.date().replace(day=1) for d in pd.to_datetime(result["period"], errors="coerce").dropna()}
+    if "financial_year" in result.columns:
+        for fy in result["financial_year"].dropna().astype(str):
+            if len(fy) >= 4 and fy[:4].isdigit():
+                y = int(fy[:4])
+                months |= {date(y + (m < 4), m, 1) for m in range(1, 13)}
+    s = sql.lower()
+    notes = []
+    for provider, missing in gaps.items():
+        hit = sorted(months & missing)
+        if not hit:
+            continue
+        words = [w for w in provider.lower().replace("nhs", "").split() if len(w) > 3][:2]
+        mentions_it = any(w in s for w in words) or "north central" in s
+        limited_elsewhere = ("provider_name" in s or "provider_area" in s) and not mentions_it
+        if not limited_elsewhere:
+            span = f"{hit[0]:%B %Y}" + (f" to {hit[-1]:%B %Y}" if len(hit) > 1 else "")
+            notes.append(f"{provider} has no data for {span}, so totals that should include it "
+                         "(London, North Central London, or the trust itself) are too low for those months.")
+    return " ".join(notes)
+
+
+def build_prompt(question: str, sql: str, result: pd.DataFrame, assumptions: str = "", caveat: str = "") -> str:
     table = result.head(60).to_csv(index=False)
     more = f"\n(Showing 60 of {len(result)} rows.)" if len(result) > 60 else ""
     if result.attrs.get("truncated"):
@@ -33,12 +66,13 @@ Result (CSV):
 {table}{more}
 
 Note on the data: {DATA_NOTE}
+{("Coverage caveat (mention this in one sentence): " + caveat) if caveat else ""}
 
 Write the answer:
 - Two to four sentences. Lead with the direct answer.
-- Say which month or months the figures are for (e.g. "September 2026").
+- Say which month or months the figures are for (e.g. "April 2023").
 - Use only numbers that appear in the result, or simple differences between them. Round sensibly
-  (e.g. "7.41 million", "59.8%"). Describe changes in percentages in percentage points.
+  (e.g. "1.16 million", "63.2%"). Describe changes in percentages in percentage points.
 - If an assumption in the SQL matters to the answer, mention it briefly.
 - Don't speculate about causes. If the result is empty, say that no matching data was found.
 """

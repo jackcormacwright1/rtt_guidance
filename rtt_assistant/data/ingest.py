@@ -1,183 +1,199 @@
-"""Load NHS England's monthly RTT 'Full CSV data file' extracts into a DuckDB database.
+"""Load the London RTT extract into a DuckDB database.
 
-Each monthly file has one row per provider x commissioner x treatment function x RTT part, with
-patient counts in weekly bands ('Gt 00 To 01 Weeks SUM 1', ..., 'Gt 104 Weeks SUM 1'). The parts are:
+The extract (data/source/) is NHS England's published Referral to Treatment statistics for London
+providers, April 2018 to April 2023, one row per month x provider x commissioner x RTT part x treatment
+function. The four North West London trusts (and Royal Free London) appear individually; every other London
+trust is grouped by its area ('Other London' with an area code). Commissioners are the North West London
+CCGs (which merged and were renamed during the period) or 'Non-NWL'. Waiting times come in five bands.
+
+RTT parts and where they go:
 
     Part_1A  completed pathways, admitted          -> completed_pathways (pathway_type 'admitted')
     Part_1B  completed pathways, non-admitted      -> completed_pathways (pathway_type 'non_admitted')
-    Part_2   incomplete pathways (still waiting)   -> waiting_list
-    Part_2A  incomplete pathways with a decision to admit (a subset of Part_2; not loaded)
+    Part_2   incomplete pathways (the waiting list) -> waiting_list
+    Part_2A  incomplete pathways with a decision to admit (a subset of Part_2) -> waiting_list_dta
     Part_3   new RTT periods (clock starts)        -> new_periods
 
-The loader sums over commissioners, drops the all-specialties total rows (so totals are always sums),
-turns the weekly bands into the cumulative counts in schema.py, and checks totals as it goes.
+The loader groups commissioners into 'North West London' / 'Outside North West London' (so the CCG
+renames don't break time series), gives grouped providers readable names, checks that the bands add up to
+each row's total, and records which months each provider is present in (the coverage table).
 """
 
 from __future__ import annotations
 
-import io
-import re
-import zipfile
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 import duckdb
 import pandas as pd
 
-from .schema import COMPLETED, NEW_PERIODS, TABLES, WAITING_LIST, create_sql
+from .schema import (AREAS, COMPLETED, COVERAGE, DATA_TABLES, NEW_PERIODS, TABLES, WAITING_LIST,
+                     WAITING_LIST_DTA, create_sql)
 
-BAND = re.compile(r"^gt_(\d+)_to_(\d+)_weeks_sum_1$")
-TOP_BAND = re.compile(r"^gt_(\d+)_weeks_sum_1$")
-MONTHS = {m.lower(): i for i, m in enumerate(
-    ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
-     "November", "December"], start=1)}
-KEY_MAP = {
-    "provider_org_code": "provider_code", "provider_org_name": "provider_name",
-    "provider_parent_org_code": "provider_parent_code", "provider_parent_name": "provider_parent_name",
-    "treatment_function_code": "treatment_function_code", "treatment_function_name": "treatment_function_name",
-}
-KEYS = ["period", "provider_code", "provider_name", "provider_parent_code", "provider_parent_name",
-        "treatment_function_code", "treatment_function_name"]
+RAW_COLUMNS = ["year_month", "financial_year", "Provider", "Provider_STP", "Commissioner Org", "RTT Part Type",
+               "Treatment Function Name", "Total", "<18wks", "18-26wks", "26-40wks", "40-52wks", ">52wks"]
+RAW_BANDS = {"<18wks": "within_18_weeks", "18-26wks": "weeks_18_to_26", "26-40wks": "weeks_26_to_40",
+             "40-52wks": "weeks_40_to_52", ">52wks": "over_52_weeks"}
+KEYS = ["period", "financial_year", "provider_name", "provider_is_group", "provider_area", "commissioner_group",
+        "treatment_function_name"]
+NWL_OUTSIDE = "Non-NWL"
+SMALL_WORDS = {"and", "of", "the", "for"}
 
 
 class IngestError(ValueError):
     pass
 
 
-def _norm(col: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", col.strip().lower()).strip("_")
-
-
-def parse_period(value: str) -> date:
-    """'RTT-September-2026' (or 'September 2026', '2026-09') -> date(2026, 9, 1)."""
-    v = str(value).strip()
-    m = re.search(r"([A-Za-z]+)[-\s_]+(\d{4})", v)
-    if m and m.group(1).lower() in MONTHS:
-        return date(int(m.group(2)), MONTHS[m.group(1).lower()], 1)
-    m = re.search(r"(\d{4})-(\d{1,2})", v)
-    if m:
-        return date(int(m.group(1)), int(m.group(2)), 1)
-    raise IngestError(f"Unrecognised period: {value!r}")
-
-
-def read_extract(path: str | Path) -> pd.DataFrame:
-    """Read one monthly extract (.zip containing a CSV, or a .csv) with normalised column names."""
+def read_source(path: str | Path) -> pd.DataFrame:
+    """Read the extract from the original workbook (.xlsx, sheet 'Data') or its parquet copy."""
     path = Path(path)
-    if path.suffix.lower() == ".zip":
-        with zipfile.ZipFile(path) as z:
-            csvs = [n for n in z.namelist() if n.lower().endswith(".csv")]
-            if len(csvs) != 1:
-                raise IngestError(f"{path.name}: expected one CSV inside, found {csvs}")
-            raw = pd.read_csv(io.BytesIO(z.read(csvs[0])), dtype=str, low_memory=False)
+    if path.suffix.lower() == ".parquet":
+        raw = pd.read_parquet(path)
+    elif path.suffix.lower() in (".xlsx", ".xlsm"):
+        raw = pd.read_excel(path, sheet_name="Data", engine="openpyxl")
     else:
-        raw = pd.read_csv(path, dtype=str, low_memory=False)
-    raw.columns = [_norm(c) for c in raw.columns]
+        raise IngestError(f"{path.name}: expected .xlsx or .parquet")
+    missing = [c for c in RAW_COLUMNS if c not in raw.columns]
+    if missing:
+        raise IngestError(f"{path.name}: missing columns {missing}")
     return raw
 
 
-def _bands(cols: list[str]) -> list[tuple[str, int, int | None]]:
-    """(column, lower weeks, upper weeks or None for the open top band)."""
-    out = []
-    for c in cols:
-        if m := BAND.match(c):
-            out.append((c, int(m.group(1)), int(m.group(2))))
-        elif m := TOP_BAND.match(c):
-            out.append((c, int(m.group(1)), None))
-    if not out:
-        raise IngestError("No weekly band columns found (expected e.g. 'Gt 00 To 01 Weeks SUM 1').")
-    return sorted(out, key=lambda b: b[1])
+def trust_name(raw: str) -> str:
+    """'THE HILLINGDON HOSPITALS NHS FOUNDATION TRUST' -> 'The Hillingdon Hospitals NHS Foundation Trust'."""
+    words = []
+    for i, w in enumerate(str(raw).strip().split()):
+        lw = w.lower()
+        if lw == "nhs":
+            words.append("NHS")
+        elif lw in SMALL_WORDS and i > 0:
+            words.append(lw)
+        else:
+            words.append(lw.capitalize())
+    return " ".join(words)
+
+
+def provider_columns(provider: pd.Series, stp: pd.Series) -> pd.DataFrame:
+    area = stp.map(AREAS)
+    if area.isna().any():
+        raise IngestError(f"Unknown area codes: {sorted(stp[area.isna()].unique())}")
+    grouped = provider.str.strip().str.lower() == "other london"
+    named = provider.map(trust_name)
+    group_name = area + " providers (grouped)"
+    # In North Central London, Royal Free is listed separately, so the group holds the other trusts. (Its name
+    # avoids the words 'Royal Free' so that a search for Royal Free can't match the group too.)
+    group_name = group_name.where(stp != "NCL", "Other North Central London providers (grouped)")
+    return pd.DataFrame({"provider_name": named.where(~grouped, group_name),
+                         "provider_is_group": grouped, "provider_area": area})
 
 
 def tidy(raw: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    """One raw monthly extract -> the three tables in schema.py."""
-    required = {"period", "rtt_part_type", *KEY_MAP}
-    missing = required - set(raw.columns)
-    if missing:
-        raise IngestError(f"Missing columns: {sorted(missing)}")
-    df = raw.rename(columns=KEY_MAP).copy()
-    df["period"] = df["period"].map(parse_period)
-    bands = _bands(list(df.columns))
-    band_cols = [b[0] for b in bands]
-    numeric = band_cols + [c for c in ("total", "patients_with_unknown_clock_start_date", "total_all") if c in df]
-    for c in numeric:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype("int64")
+    """The raw extract -> the four data tables in schema.py."""
+    df = raw[RAW_COLUMNS].copy()
+    ym = pd.to_numeric(df["year_month"], errors="raise").astype(int)
+    df["period"] = [date(v // 100, v % 100, 1) for v in ym]
+    df = pd.concat([df.reset_index(drop=True),
+                    provider_columns(df["Provider"].reset_index(drop=True),
+                                     df["Provider_STP"].reset_index(drop=True))], axis=1)
+    df["commissioner_group"] = (df["Commissioner Org"].str.strip() == NWL_OUTSIDE).map(
+        {True: "Outside North West London", False: "North West London"})
+    df["treatment_function_name"] = df["Treatment Function Name"].str.strip()
+    df["Total"] = pd.to_numeric(df["Total"], errors="raise").astype("int64")
+    part = df["RTT Part Type"].str.strip().str.lower()
 
-    # Drop the all-specialties rows so that every total in the database is a sum of its parts.
-    is_total_tf = df["treatment_function_code"].str.upper().str.endswith("999")
-    df = df[~is_total_tf]
-    part = df["rtt_part_type"].str.strip().str.lower()
+    def banded(frame: pd.DataFrame, total_name: str, allow_unknown: bool = False) -> pd.DataFrame:
+        """Rename the bands and check them against the row total. For completed pathways the total also
+        counts pathways with an unknown clock start, which have no band; those are kept separately."""
+        frame = frame.rename(columns=RAW_BANDS).copy()
+        bands = list(RAW_BANDS.values())
+        frame[bands] = frame[bands].apply(pd.to_numeric, errors="raise").fillna(0).astype("int64")
+        unknown = frame["Total"] - frame[bands].sum(axis=1)
+        bad = (unknown < 0) if allow_unknown else (unknown != 0)
+        if bad.any():
+            raise IngestError(f"{total_name}: the waiting-time bands don't add up to the total on {int(bad.sum())} rows.")
+        frame[total_name] = frame[bands].sum(axis=1)
+        if allow_unknown:
+            frame["unknown_clock_start"] = unknown
+        frame["over_18_weeks"] = frame[bands[1:]].sum(axis=1)
+        return frame
 
-    def cum(frame: pd.DataFrame, lower_than: int | None = None, over: int | None = None) -> pd.Series:
-        if lower_than is not None:  # bands entirely at or below `lower_than` weeks
-            cols = [c for c, lo, hi in bands if hi is not None and hi <= lower_than]
-        else:  # bands entirely above `over` weeks
-            cols = [c for c, lo, hi in bands if lo >= over]
-        return frame[cols].sum(axis=1)
+    def grouped(frame: pd.DataFrame, table, extra: list[str] | None = None) -> pd.DataFrame:
+        cols = [c.name for c in table.columns]
+        keys = KEYS + (extra or [])
+        out = frame.groupby(keys, as_index=False)[[c for c in cols if c not in keys]].sum()
+        return out[cols]
 
-    def grouped(frame: pd.DataFrame, extra_keys: list[str] | None = None) -> pd.DataFrame:
-        return frame.groupby(KEYS + (extra_keys or []), dropna=False, as_index=False).sum(numeric_only=True)
-
-    # Waiting list (incomplete pathways)
-    w = df[part == "part_2"].copy()
-    w["total_waiting"] = w[band_cols].sum(axis=1)
-    if "total" in w and not (w["total"] == w["total_waiting"]).all():
-        bad = int((w["total"] != w["total_waiting"]).sum())
-        raise IngestError(f"Waiting list: weekly bands don't add up to 'Total' on {bad} rows.")
-    w["within_18_weeks"] = cum(w, lower_than=18)
-    w["over_18_weeks"] = cum(w, over=18)
-    for k in (52, 65, 78, 104):
-        w[f"over_{k}_weeks"] = cum(w, over=k)
-    w["unknown_clock_start"] = w.get("patients_with_unknown_clock_start_date", 0)
-    waiting = grouped(w[KEYS + [c.name for c in WAITING_LIST.columns[len(KEYS):]]])
-
-    # Completed pathways
-    c = df[part.isin(["part_1a", "part_1b"])].copy()
-    c["pathway_type"] = part[c.index].map({"part_1a": "admitted", "part_1b": "non_admitted"})
-    c["total_completed"] = c[band_cols].sum(axis=1)
-    c["within_18_weeks"] = cum(c, lower_than=18)
-    c["over_52_weeks"] = cum(c, over=52)
-    completed = grouped(c[KEYS + ["pathway_type", "total_completed", "within_18_weeks", "over_52_weeks"]],
-                        ["pathway_type"])
-    completed = completed[[col.name for col in COMPLETED.columns]]
-
-    # New periods (clock starts): counts are in 'Total' (or the bands, whichever is populated)
+    waiting = grouped(banded(df[part == "part_2"], "total_waiting"), WAITING_LIST)
+    dta = grouped(banded(df[part == "part_2a"], "total_waiting"), WAITING_LIST_DTA)
+    c = banded(df[part.isin(["part_1a", "part_1b"])], "total_completed", allow_unknown=True)
+    c["pathway_type"] = c["RTT Part Type"].str.strip().str.lower().map({"part_1a": "admitted", "part_1b": "non_admitted"})
+    completed = grouped(c, COMPLETED, ["pathway_type"])
     n = df[part == "part_3"].copy()
-    n["new_clock_starts"] = n["total"] if "total" in n else n[band_cols].sum(axis=1)
-    new = grouped(n[KEYS + ["new_clock_starts"]])
+    n["new_clock_starts"] = n["Total"]
+    new = grouped(n, NEW_PERIODS)
 
-    return {WAITING_LIST.name: waiting, COMPLETED.name: completed, NEW_PERIODS.name: new}
+    unknown = set(part.unique()) - {"part_1a", "part_1b", "part_2", "part_2a", "part_3"}
+    if unknown:
+        raise IngestError(f"Unknown RTT part types: {sorted(unknown)}")
+    return {WAITING_LIST.name: waiting, WAITING_LIST_DTA.name: dta, COMPLETED.name: completed, NEW_PERIODS.name: new}
 
 
-def build_database(sources: list[str | Path], db_path: str | Path) -> pd.DataFrame:
-    """Load every extract in ``sources`` into a fresh DuckDB file. Returns one summary row per month."""
+def _ranges(months: list[date]) -> str:
+    """[2019-02, 2019-03, ..., 2021-02] -> '2019-02 to 2021-02'; separate runs joined with '; '."""
+    if not months:
+        return ""
+    runs, start, prev = [], months[0], months[0]
+    for m in months[1:]:
+        if (m.year * 12 + m.month) - (prev.year * 12 + prev.month) != 1:
+            runs.append((start, prev))
+            start = m
+        prev = m
+    runs.append((start, prev))
+    return "; ".join(f"{a:%Y-%m}" if a == b else f"{a:%Y-%m} to {b:%Y-%m}" for a, b in runs)
+
+
+def coverage(waiting: pd.DataFrame) -> pd.DataFrame:
+    """Which months each provider is present in, judged from the waiting list."""
+    all_months = sorted(waiting["period"].unique())
+    rows = []
+    for (name, area), g in waiting.groupby(["provider_name", "provider_area"]):
+        have = set(g["period"])
+        first, last = min(have), max(have)
+        gap = [m for m in all_months if first <= m <= last and m not in have]
+        rows.append({"provider_name": name, "provider_area": area, "first_period": first, "last_period": last,
+                     "months_reported": len(have), "missing_months": _ranges(gap)})
+    return pd.DataFrame(rows)[[c.name for c in COVERAGE.columns]]
+
+
+def build_database(source: str | Path, db_path: str | Path) -> pd.DataFrame:
+    """Load the extract into a fresh DuckDB file. Returns one summary row per month (London totals)."""
     db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
     if db_path.exists():
         db_path.unlink()
-    frames: dict[str, list[pd.DataFrame]] = {t.name: [] for t in TABLES}
-    loaded = []
-    for src in sorted(sources):
-        tables = tidy(read_extract(src))
-        periods = set(tables[WAITING_LIST.name]["period"])
-        loaded.append({"file": Path(src).name, "periods": ", ".join(str(p) for p in sorted(periods))})
-        for name, df in tables.items():
-            frames[name].append(df)
+    tables = tidy(read_source(source))
+    tables[COVERAGE.name] = coverage(tables[WAITING_LIST.name])
 
     con = duckdb.connect(str(db_path))
-    for t in TABLES:
-        con.execute(create_sql(t))
-        df = pd.concat(frames[t.name], ignore_index=True)
-        dupes = df.duplicated(subset=[c.name for c in t.columns if c.type == "VARCHAR" or c.name == "period"]).sum()
-        if dupes:
-            raise IngestError(f"{t.name}: {dupes} duplicate rows - is the same month loaded twice?")
-        con.register("incoming", df[[c.name for c in t.columns]])
-        con.execute(f"INSERT INTO {t.name} SELECT * FROM incoming")
-        con.unregister("incoming")
-    con.execute("CREATE TABLE load_log (file VARCHAR, periods VARCHAR, loaded_at TIMESTAMP)")
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    con.executemany("INSERT INTO load_log VALUES (?, ?, ?)", [(r["file"], r["periods"], now) for r in loaded])
-    summary = con.execute(
-        "SELECT period, COUNT(DISTINCT provider_code) AS providers, SUM(total_waiting) AS total_waiting, "
-        "ROUND(100.0 * SUM(within_18_weeks) / SUM(total_waiting), 2) AS pct_within_18_weeks "
-        "FROM waiting_list GROUP BY period ORDER BY period").df()
-    con.close()
+    try:
+        for t in TABLES:
+            con.execute(create_sql(t))
+            df = tables[t.name]
+            if t in DATA_TABLES:
+                keys = KEYS + (["pathway_type"] if t is COMPLETED else [])
+                dupes = int(df.duplicated(subset=keys).sum())
+                if dupes:
+                    raise IngestError(f"{t.name}: {dupes} duplicate rows.")
+            con.register("incoming", df[[c.name for c in t.columns]])
+            con.execute(f"INSERT INTO {t.name} SELECT * FROM incoming")
+            con.unregister("incoming")
+        con.execute("CREATE TABLE load_log (source VARCHAR, rows_read BIGINT, loaded_at TIMESTAMP)")
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        con.execute("INSERT INTO load_log VALUES (?, ?, ?)", [Path(source).name, int(sum(map(len, tables.values()))), now])
+        summary = con.execute(
+            "SELECT period, COUNT(DISTINCT provider_name) AS providers, SUM(total_waiting) AS total_waiting, "
+            "ROUND(100.0 * SUM(within_18_weeks) / SUM(total_waiting), 1) AS pct_within_18_weeks "
+            "FROM waiting_list GROUP BY period ORDER BY period").df()
+    finally:
+        con.close()
     return summary

@@ -1,94 +1,116 @@
 import json
 
-import duckdb
 import pandas as pd
 import pytest
 
-from rtt_assistant.data.ingest import IngestError, build_database, parse_period, read_extract, tidy
+from rtt_assistant.data.ingest import IngestError, build_database, tidy, trust_name
 from rtt_assistant.llm import ScriptedChat
-from rtt_assistant.pipeline import answer_question
+from rtt_assistant.pipeline import answer_question, coverage_gaps
 from rtt_assistant.sql.generate import database_facts, parse_reply
 from rtt_assistant.sql.run import connect_readonly
-from rtt_assistant.sql.summarise import ungrounded_numbers
-from tests.fake_extract import BANDS, make_extract, write_zip
+from rtt_assistant.sql.summarise import coverage_warning, ungrounded_numbers
+from tests.fake_source import BANDS, make_source
+
+MONTHS = [202301, 202302, 202303, 202304]
 
 
 @pytest.fixture(scope="module")
 def db_path(tmp_path_factory):
     d = tmp_path_factory.mktemp("rtt")
-    files = [write_zip(make_extract(m, 2026, seed=i), d / f"Full-CSV-data-file-{m[:3]}26.zip")
-             for i, m in enumerate(["July", "August", "September"])]
-    build_database(files, d / "rtt.duckdb")
+    src = d / "source.parquet"
+    make_source(MONTHS, royal_free_missing=(202302,)).to_parquet(src)
+    build_database(src, d / "rtt.duckdb")
     return d / "rtt.duckdb"
 
 
-def test_parse_period():
-    assert str(parse_period("RTT-September-2026")) == "2026-09-01"
-    assert str(parse_period("2026-03")) == "2026-03-01"
-    with pytest.raises(IngestError):
-        parse_period("Q3 2026")
+def test_trust_names_are_readable():
+    assert trust_name("THE HILLINGDON HOSPITALS NHS FOUNDATION TRUST") == "The Hillingdon Hospitals NHS Foundation Trust"
+    assert trust_name("CHELSEA AND WESTMINSTER HOSPITAL NHS FOUNDATION TRUST").startswith("Chelsea and Westminster")
 
 
 def test_tidy_matches_the_raw_bands():
-    raw = make_extract("September", 2026, seed=3)
-    t = tidy(read_extract_from_frame(raw))
+    raw = make_source([202304], seed=3)
+    t = tidy(raw)
     w = t["waiting_list"]
-    part2 = raw[(raw["RTT Part Type"] == "Part_2") & (raw["Treatment Function Code"] != "C_999")]
-    assert w["total_waiting"].sum() == part2["Total"].sum()  # summed over commissioners, no double counting
-    within = part2[BANDS[:18]].sum().sum()
-    over52 = part2[BANDS[52:]].sum().sum()
-    assert w["within_18_weeks"].sum() == within
-    assert w["over_52_weeks"].sum() == over52
+    part2 = raw[raw["RTT Part Type"] == "Part_2"]
+    assert w["total_waiting"].sum() == part2["Total"].sum()  # nothing lost or double counted
+    assert w["over_52_weeks"].sum() == part2[">52wks"].sum()
     assert (w["within_18_weeks"] + w["over_18_weeks"] == w["total_waiting"]).all()
-    assert set(t["completed_pathways"]["pathway_type"]) == {"admitted", "non_admitted"}
-    assert len(w) == 2 * 2  # providers x treatment functions; commissioners summed, C_999 dropped
+    # Commissioners grouped into two; three commissioners in, two groups out
+    assert set(w["commissioner_group"]) == {"North West London", "Outside North West London"}
+    assert len(w) == len(raw["Provider"].str.cat(raw["Provider_STP"]).unique()) * 2 * 2
+    # The DTA list is kept apart from the waiting list
+    assert t["waiting_list_dta"]["total_waiting"].sum() == raw.loc[raw["RTT Part Type"] == "Part_2A", "Total"].sum()
 
 
-def read_extract_from_frame(raw: pd.DataFrame) -> pd.DataFrame:
-    import re
-    df = raw.astype(str).copy()
-    df.columns = [re.sub(r"[^a-z0-9]+", "_", c.strip().lower()).strip("_") for c in df.columns]
-    return df
+def test_completed_pathways_keep_unknown_clock_starts_separately():
+    raw = make_source([202304], seed=4)
+    c = tidy(raw)["completed_pathways"]
+    part1 = raw[raw["RTT Part Type"].isin(["Part_1A", "Part_1B"])]
+    assert c["total_completed"].sum() == part1[BANDS].sum().sum()
+    assert c["total_completed"].sum() + c["unknown_clock_start"].sum() == part1["Total"].sum()
+    assert set(c["pathway_type"]) == {"admitted", "non_admitted"}
 
 
-def test_build_database_refuses_duplicate_months(tmp_path):
-    f1 = write_zip(make_extract("July", 2026), tmp_path / "a.zip")
-    f2 = write_zip(make_extract("July", 2026, seed=9), tmp_path / "b.zip")
-    with pytest.raises(IngestError, match="duplicate"):
-        build_database([f1, f2], tmp_path / "x.duckdb")
+def test_grouped_providers_get_names_that_dont_match_royal_free():
+    w = tidy(make_source([202304]))["waiting_list"]
+    groups = set(w.loc[w["provider_is_group"], "provider_name"])
+    assert groups == {"Other North Central London providers (grouped)", "South East London providers (grouped)"}
+    assert not any("royal free" in g.lower() for g in groups)
 
 
-def test_database_has_three_months(db_path):
+def test_bands_that_dont_add_up_are_rejected():
+    raw = make_source([202304])
+    i = raw.index[raw["RTT Part Type"] == "Part_2"][0]
+    raw.loc[i, "Total"] += 5
+    with pytest.raises(IngestError, match="don't add up"):
+        tidy(raw)
+
+
+def test_coverage_records_gaps(db_path):
     con = connect_readonly(db_path)
-    assert con.execute("SELECT COUNT(DISTINCT period) FROM waiting_list").fetchone()[0] == 3
-    assert "2026-09" in database_facts(con)
+    cov = con.execute("SELECT provider_name, months_reported, missing_months FROM coverage").df()
+    rf = cov[cov.provider_name.str.contains("Royal Free")].iloc[0]
+    assert rf.months_reported == 3 and rf.missing_months == "2023-02"
+    assert (cov.loc[~cov.provider_name.str.contains("Royal Free"), "missing_months"] == "").all()
+    assert "no data 2023-02" in database_facts(con)
 
 
 def _reply(sql=None, cannot=False, reason="", assumptions=""):
     return json.dumps({"sql": sql, "cannot_answer": cannot, "reason": reason, "assumptions": assumptions})
 
 
-NATIONAL = ("SELECT period, SUM(total_waiting) AS total_waiting, "
-            "ROUND(100.0 * SUM(within_18_weeks) / SUM(total_waiting), 1) AS pct_within_18_weeks "
-            "FROM waiting_list GROUP BY period ORDER BY period")
+LONDON = ("SELECT period, SUM(total_waiting) AS total_waiting, "
+          "ROUND(100.0 * SUM(within_18_weeks) / SUM(total_waiting), 1) AS pct_within_18_weeks "
+          "FROM waiting_list GROUP BY period ORDER BY period")
 
 
-def test_pipeline_happy_path(db_path):
+def test_pipeline_happy_path_with_coverage_caveat(db_path):
     con = connect_readonly(db_path)
-    result = con.execute(NATIONAL).df()
+    result = con.execute(LONDON).df()
     latest = result.iloc[-1]
-    summary = (f"In September 2026, {latest.pct_within_18_weeks}% of the {int(latest.total_waiting):,} patients "
+    summary = (f"In April 2023, {latest.pct_within_18_weeks}% of the {int(latest.total_waiting):,} patients "
                f"waiting had waited under 18 weeks.")
-    llm = ScriptedChat([_reply(NATIONAL), summary])
-    a = answer_question("What is national performance?", llm, con, database_facts(con))
-    assert a.error is None and a.result is not None and len(a.result) == 3
+    llm = ScriptedChat([_reply(LONDON), summary])
+    a = answer_question("What is London performance?", llm, con, database_facts(con))
+    assert a.error is None and a.result is not None and len(a.result) == 4
     assert a.answer == summary and a.ungrounded == [] and a.llm_calls == 2
-    assert "waiting_list" in llm.calls[0][1] and "Months available" in llm.calls[0][1]
+    assert "Royal Free" in a.caveat and "February 2023" in a.caveat
+    assert "Coverage caveat" in llm.calls[1][1]  # the summariser is told
+
+
+def test_no_caveat_when_the_query_is_about_another_trust(db_path):
+    con = connect_readonly(db_path)
+    sql = LONDON.replace("FROM waiting_list", "FROM waiting_list WHERE provider_name ILIKE '%imperial%'")
+    a = answer_question("Imperial?", ScriptedChat([_reply(sql), "ok"]), con, database_facts(con))
+    assert a.caveat == ""
+    r = pd.DataFrame({"period": ["2023-01-01"], "n": [1]})
+    assert coverage_warning(r, LONDON, coverage_gaps(con)) == ""  # months outside the gap
 
 
 def test_pipeline_retries_with_the_error(db_path):
     con = connect_readonly(db_path)
-    llm = ScriptedChat([_reply("SELECT period, SUM(waiting) FROM waiting_list GROUP BY 1"), _reply(NATIONAL), "ok"])
+    llm = ScriptedChat([_reply("SELECT period, SUM(waiting) FROM waiting_list GROUP BY 1"), _reply(LONDON), "ok"])
     a = answer_question("q", llm, con, database_facts(con))
     assert a.error is None and len(a.attempts) == 2 and a.attempts[0]["error"]
     assert "previous query failed" in llm.calls[1][1].lower() and "waiting" in llm.calls[1][1]
@@ -115,21 +137,21 @@ def test_parse_reply_tolerates_fences():
 
 
 def test_grounding_check():
-    df = pd.DataFrame({"period": ["2026-08-01", "2026-09-01"], "total_waiting": [7_412_345, 7_398_001],
-                       "pct": [59.4, 59.8]})
-    ok = "In September 2026, 59.8% were within 18 weeks, up 0.4 points; 7.40 million were waiting."
+    df = pd.DataFrame({"period": ["2023-03-01", "2023-04-01"], "total_waiting": [1_150_210, 1_161_866],
+                       "pct": [63.6, 63.2]})
+    ok = "In April 2023, 63.2% were within 18 weeks, down 0.4 points; 1.16 million were waiting."
     assert ungrounded_numbers(ok, df) == []
-    bad = "In September 2026, 61.2% were within 18 weeks."
+    bad = "In April 2023, 61.2% were within 18 weeks."
     assert ungrounded_numbers(bad, df) == ["61.2%"]
 
 
 def test_result_contains_scoring():
     from rtt_assistant.evaluation import result_contains
-    gold = pd.DataFrame({"period": pd.to_datetime(["2026-08-01", "2026-09-01"]), "pct": [59.4, 59.8]})
-    same_diff_names = pd.DataFrame({"month": ["2026-08-01", "2026-09-01"], "pct_within_18": [59.43, 59.81],
+    gold = pd.DataFrame({"period": pd.to_datetime(["2023-03-01", "2023-04-01"]), "pct": [63.6, 63.2]})
+    same_diff_names = pd.DataFrame({"month": ["2023-03-01", "2023-04-01"], "pct_within_18": [63.61, 63.24],
                                     "extra": [1, 2]})
     assert result_contains(same_diff_names, gold)
-    wrong = same_diff_names.assign(pct_within_18=[59.43, 60.2])
+    wrong = same_diff_names.assign(pct_within_18=[63.61, 64.0])
     assert not result_contains(wrong, gold)
     names = pd.DataFrame({"provider_name": ["TRUST A", "TRUST B"], "n": [10, 5]})
     assert result_contains(names.assign(provider_name=["trust a", "trust b"]), names)

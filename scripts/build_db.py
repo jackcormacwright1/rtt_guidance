@@ -1,11 +1,11 @@
-"""Build data/rtt.duckdb from NHS England's monthly RTT 'Full CSV data file' extracts.
+"""Build data/rtt.duckdb from the London RTT extract.
 
 Usage:
-    python scripts/build_db.py data/raw/*.zip            # from files you've downloaded
-    python scripts/build_db.py --download 13             # fetch the latest 13 months first (needs internet)
+    python scripts/build_db.py                                        # from data/source/ (committed)
+    python scripts/build_db.py "National RTT Waiting List Data.xlsx"  # from the original workbook
 
-The extracts are published under the Open Government Licence by NHS England:
-https://www.england.nhs.uk/statistics/statistical-work-areas/rtt-waiting-times/
+The figures are NHS England's Referral to Treatment waiting times statistics, published under the
+Open Government Licence: https://www.england.nhs.uk/statistics/statistical-work-areas/rtt-waiting-times/
 """
 
 from __future__ import annotations
@@ -19,26 +19,17 @@ sys.path.insert(0, str(ROOT))
 
 from rtt_assistant.data.ingest import build_database  # noqa: E402
 
+SOURCE = ROOT / "data" / "source" / "london_rtt_2018-04_to_2023-04.parquet"
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("files", nargs="*", type=Path, help="monthly extracts (.zip or .csv)")
-    ap.add_argument("--download", type=int, metavar="MONTHS", help="download the latest MONTHS extracts first")
-    ap.add_argument("--raw-dir", type=Path, default=ROOT / "data" / "raw")
+    ap.add_argument("source", nargs="?", type=Path, default=SOURCE, help="the extract (.parquet or .xlsx)")
     ap.add_argument("--out", type=Path, default=ROOT / "data" / "rtt.duckdb")
     args = ap.parse_args()
-
-    files = list(args.files)
-    if args.download:
-        from rtt_assistant.data.download import download_latest
-        files += download_latest(args.download, args.raw_dir)
-    if not files:
-        files = sorted(args.raw_dir.glob("*.zip"))
-    if not files:
-        ap.error("No extracts given or found in data/raw/.")
-    summary = build_database(sorted(set(files)), args.out)
+    summary = build_database(args.source, args.out)
     print(summary.to_string(index=False))
-    print(f"\nWrote {args.out} ({args.out.stat().st_size / 1e6:.1f} MB) from {len(set(files))} file(s).")
+    print(f"\nWrote {args.out} ({args.out.stat().st_size / 1e6:.1f} MB) from {args.source.name}.")
 
 
 if __name__ == "__main__":

@@ -7,3 +7,5 @@ data/raw/
 eval/results/*.csv
 !eval/results/.gitkeep
 .streamlit/secrets.toml
+
+data/rtt.duckdb
