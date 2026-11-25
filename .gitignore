@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.cache_rtt_bot/
+.pytest_cache/
+.venv/
+data/raw/
+eval/results/*.csv
+!eval/results/.gitkeep
+.streamlit/secrets.toml
+
+data/rtt.duckdb

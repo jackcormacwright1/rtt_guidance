@@ -1,0 +1,172 @@
+# Evaluation questions for the text-to-SQL pipeline (scripts/eval_data.py).
+#
+# Answerable questions have a hand-written gold query. A generated answer counts as correct if its result
+# contains the values in the gold result's key_columns (numbers to the gold's precision, text case-insensitively),
+# wherever they appear. Unanswerable questions (no gold_sql) are correct only if the model declines.
+#
+# Categories: lookup, trend, ranking, share, demand, flow (patients across areas), completed, coverage, unanswerable.
+
+- id: d01
+  category: lookup
+  question: How many patients were on the waiting list across London in the latest month, and what share had waited under 18 weeks?
+  gold_sql: >
+    SELECT period, SUM(total_waiting) AS total_waiting,
+           ROUND(100.0 * SUM(within_18_weeks) / SUM(total_waiting), 1) AS pct_within_18_weeks
+    FROM waiting_list WHERE period = (SELECT MAX(period) FROM waiting_list) GROUP BY period
+  key_columns: [total_waiting, pct_within_18_weeks]
+
+- id: d02
+  category: trend
+  question: How has 18-week performance at Imperial changed over the last two months?
+  gold_sql: >
+    SELECT period, ROUND(100.0 * SUM(within_18_weeks) / SUM(total_waiting), 1) AS pct_within_18_weeks
+    FROM waiting_list WHERE provider_name ILIKE '%imperial%'
+      AND period IN ((SELECT MAX(period) FROM waiting_list), (SELECT MAX(period) FROM waiting_list) - INTERVAL 2 MONTH)
+    GROUP BY period ORDER BY period
+  key_columns: [pct_within_18_weeks]
+
+- id: d03
+  category: ranking
+  question: Which North West London trust had the most patients waiting over 52 weeks in April 2023?
+  gold_sql: >
+    SELECT provider_name, SUM(over_52_weeks) AS over_52_weeks FROM waiting_list
+    WHERE provider_area = 'North West London' AND period = DATE '2023-04-01'
+    GROUP BY provider_name ORDER BY over_52_weeks DESC LIMIT 1
+  key_columns: [provider_name, over_52_weeks]
+
+- id: d04
+  category: trend
+  question: How many patients were waiting over 52 weeks across North West London trusts in April 2020 and in April 2021?
+  gold_sql: >
+    SELECT period, SUM(over_52_weeks) AS over_52_weeks FROM waiting_list
+    WHERE provider_area = 'North West London' AND period IN (DATE '2020-04-01', DATE '2021-04-01')
+    GROUP BY period ORDER BY period
+  key_columns: [over_52_weeks]
+
+- id: d05
+  category: flow
+  question: How many North West London residents were waiting for treatment at hospitals outside North West London in April 2023?
+  gold_sql: >
+    SELECT SUM(total_waiting) AS total_waiting FROM waiting_list
+    WHERE commissioner_group = 'North West London' AND provider_area <> 'North West London'
+      AND period = DATE '2023-04-01'
+  key_columns: [total_waiting]
+
+- id: d06
+  category: share
+  question: What percentage of Chelsea and Westminster's waiting list in April 2023 were patients from outside North West London?
+  gold_sql: >
+    SELECT ROUND(100.0 * SUM(total_waiting) FILTER (WHERE commissioner_group = 'Outside North West London')
+                 / SUM(total_waiting), 1) AS pct_outside_nwl
+    FROM waiting_list WHERE provider_name ILIKE '%chelsea%' AND period = DATE '2023-04-01'
+  key_columns: [pct_outside_nwl]
+
+- id: d07
+  category: trend
+  question: How did the trauma and orthopaedics waiting list across London change between April 2022 and April 2023?
+  gold_sql: >
+    SELECT period, SUM(total_waiting) AS total_waiting FROM waiting_list
+    WHERE treatment_function_name ILIKE '%orthopaedic%' AND period IN (DATE '2022-04-01', DATE '2023-04-01')
+    GROUP BY period ORDER BY period
+  key_columns: [total_waiting]
+
+- id: d08
+  category: ranking
+  question: Apart from the combined 'Other' group, which specialty had the largest waiting list at North West London trusts in the latest month?
+  gold_sql: >
+    SELECT treatment_function_name, SUM(total_waiting) AS total_waiting FROM waiting_list
+    WHERE provider_area = 'North West London' AND period = (SELECT MAX(period) FROM waiting_list)
+      AND treatment_function_name <> 'Other'
+    GROUP BY treatment_function_name ORDER BY total_waiting DESC LIMIT 1
+  key_columns: [treatment_function_name, total_waiting]
+
+- id: d09
+  category: demand
+  question: How many new ENT referrals (clock starts) did North West London trusts receive in 2019-20 compared with 2022-23?
+  gold_sql: >
+    SELECT financial_year, SUM(new_clock_starts) AS new_clock_starts FROM new_periods
+    WHERE provider_area = 'North West London' AND treatment_function_name ILIKE '%ear nose%'
+      AND financial_year IN ('2019-20', '2022-23')
+    GROUP BY financial_year ORDER BY financial_year
+  key_columns: [new_clock_starts]
+
+- id: d10
+  category: completed
+  question: How many admitted pathways did Hillingdon complete in March 2023?
+  gold_sql: >
+    SELECT SUM(total_completed) AS total_completed FROM completed_pathways
+    WHERE provider_name ILIKE '%hillingdon%' AND pathway_type = 'admitted' AND period = DATE '2023-03-01'
+  key_columns: [total_completed]
+
+- id: d11
+  category: completed
+  question: What share of admitted patients treated at North West London trusts in 2022-23 had waited 18 weeks or less?
+  gold_sql: >
+    SELECT ROUND(100.0 * SUM(within_18_weeks) / SUM(total_completed), 1) AS pct_within_18_weeks
+    FROM completed_pathways
+    WHERE provider_area = 'North West London' AND pathway_type = 'admitted' AND financial_year = '2022-23'
+  key_columns: [pct_within_18_weeks]
+
+- id: d12
+  category: lookup
+  question: How many patients at London North West University Healthcare had been waiting between 40 and 52 weeks in the latest month?
+  gold_sql: >
+    SELECT SUM(weeks_40_to_52) AS weeks_40_to_52 FROM waiting_list
+    WHERE provider_name ILIKE '%north west university%' AND period = (SELECT MAX(period) FROM waiting_list)
+  key_columns: [weeks_40_to_52]
+
+- id: d13
+  category: lookup
+  question: How many patients on Imperial's waiting list had a decision to admit in April 2023?
+  gold_sql: >
+    SELECT SUM(total_waiting) AS total_waiting FROM waiting_list_dta
+    WHERE provider_name ILIKE '%imperial%' AND period = DATE '2023-04-01'
+  key_columns: [total_waiting]
+
+- id: d14
+  category: ranking
+  question: Which London area had the highest percentage of patients waiting under 18 weeks in April 2023?
+  gold_sql: >
+    SELECT provider_area, ROUND(100.0 * SUM(within_18_weeks) / SUM(total_waiting), 1) AS pct_within_18_weeks
+    FROM waiting_list WHERE period = DATE '2023-04-01'
+    GROUP BY provider_area ORDER BY pct_within_18_weeks DESC LIMIT 1
+  key_columns: [provider_area, pct_within_18_weeks]
+
+- id: d15
+  category: trend
+  question: In which month was the London-wide percentage within 18 weeks lowest, and what was it?
+  gold_sql: >
+    SELECT period, ROUND(100.0 * SUM(within_18_weeks) / SUM(total_waiting), 1) AS pct_within_18_weeks
+    FROM waiting_list GROUP BY period ORDER BY pct_within_18_weeks ASC LIMIT 1
+  key_columns: [period, pct_within_18_weeks]
+
+- id: d16
+  category: coverage
+  question: Which months is Royal Free London missing from the data?
+  gold_sql: >
+    SELECT provider_name, missing_months FROM coverage WHERE provider_name ILIKE '%royal free%'
+  key_columns: [missing_months]
+
+- id: u01
+  category: unanswerable
+  question: How many patients were waiting over 78 weeks at Imperial in April 2023?
+
+- id: u02
+  category: unanswerable
+  question: What was 18-week performance across London in September 2025?
+
+- id: u03
+  category: unanswerable
+  question: What is Imperial's 62-day cancer performance?
+
+- id: u04
+  category: unanswerable
+  question: How long were patients waiting in A&E at Hillingdon last month?
+
+- id: u05
+  category: unanswerable
+  question: Which consultant at Chelsea and Westminster has the longest waiting list?
+
+- id: u06
+  category: unanswerable
+  question: How many patients were waiting at Guy's and St Thomas' in April 2023?
